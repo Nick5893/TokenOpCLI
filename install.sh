@@ -1,124 +1,97 @@
-#!/usr/bin/env bash
-# install.sh — one-click installer for `tokenop`, the Token Op Arcade
-# (a Claude Code spinner companion).
+#!/bin/sh
+# tokenop installer — the Token Op Arcade.
 #
-#   ./install.sh              copy tokenop to ~/.local/bin, selftest, enable, status
-#   ./install.sh --uninstall  disable hooks + remove ~/.local/bin/tokenop
+#   curl -fsSL https://tokenop.dev/install.sh | sh
+#   # or, before tokenop.dev is live:
+#   curl -fsSL https://raw.githubusercontent.com/Nick5893/TokenOpCLI/main/install.sh | sh
 #
-# Idempotent: re-running re-copies the binary and re-enables without creating
-# duplicate PATH lines or duplicate hooks.
+# Works two ways:
+#   * piped via curl  -> downloads the `tokenop` script from GitHub
+#   * `sh install.sh` after a git clone -> installs the local copy
+#
+# Env knobs:
+#   TOKENOP_BIN_DIR=/somewhere   install location (default ~/.local/bin)
+#   TOKENOP_NO_ENABLE=1          install only; don't add the Claude Code hooks
+#   sh install.sh --uninstall    remove the binary + disable hooks
 set -eu
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SRC="$SCRIPT_DIR/tokenop"
-BIN_DIR="$HOME/.local/bin"
+RAW="https://raw.githubusercontent.com/Nick5893/TokenOpCLI/main"
+BIN_DIR="${TOKENOP_BIN_DIR:-$HOME/.local/bin}"
 DEST="$BIN_DIR/tokenop"
 
-# --------------------------------------------------------------------------- #
-# Uninstall
-# --------------------------------------------------------------------------- #
+say() { printf '%s\n' "$*"; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# --- uninstall ------------------------------------------------------------- #
 if [ "${1:-}" = "--uninstall" ]; then
-  echo "==> Uninstalling tokenop"
-  if [ -x "$DEST" ]; then
-    "$DEST" disable || true
-  fi
+  [ -x "$DEST" ] && "$DEST" disable >/dev/null 2>&1 || true
   rm -f "$DEST"
-  echo "Removed: $DEST"
-  echo "Removed tokenop hooks from Claude settings (if present)."
-  echo
-  echo "Your config, state, and high scores were left intact."
-  echo "To purge them too:"
-  echo "  rm -rf ~/.config/tokenop ~/.local/state/tokenop"
+  say "Removed $DEST and disabled tokenop hooks (config/scores left intact)."
   exit 0
 fi
 
-# --------------------------------------------------------------------------- #
-# Install
-# --------------------------------------------------------------------------- #
-if [ ! -f "$SRC" ]; then
-  echo "error: cannot find tokenop at $SRC" >&2
-  exit 1
-fi
+say ""
+say "  ▟█▙  tokenop — the Token Op Arcade"
+say ""
 
-echo "==> Installing tokenop to $DEST"
-mkdir -p "$BIN_DIR"
-cp "$SRC" "$DEST"
-chmod +x "$DEST"
-echo "Copied and chmod +x."
-
-# --------------------------------------------------------------------------- #
-# PATH check (append to shell rc once, guarded by grep)
-# --------------------------------------------------------------------------- #
-case ":${PATH}:" in
-  *":$BIN_DIR:"*)
-    echo "PATH already includes $BIN_DIR."
-    ;;
-  *)
-    RC=""
-    if [ -n "${ZSH_VERSION:-}" ] || [ "$(basename "${SHELL:-}")" = "zsh" ]; then
-      RC="$HOME/.zshrc"
-    elif [ -f "$HOME/.bashrc" ]; then
-      RC="$HOME/.bashrc"
-    elif [ -f "$HOME/.profile" ]; then
-      RC="$HOME/.profile"
-    else
-      RC="$HOME/.zshrc"
-    fi
-    LINE='export PATH="$HOME/.local/bin:$PATH"'
-    touch "$RC"
-    if grep -Fqs "$LINE" "$RC"; then
-      echo "PATH line already present in $RC."
-    else
-      printf '\n# Added by tokenop install.sh\n%s\n' "$LINE" >>"$RC"
-      echo "Appended PATH line to $RC."
-    fi
-    echo
-    echo "WARNING: $BIN_DIR is not on your PATH yet."
-    echo "         Open a new shell, or run:  source \"$RC\""
-    ;;
+# --- requirements ---------------------------------------------------------- #
+command -v python3 >/dev/null 2>&1 || die "python3 is required (https://www.python.org/downloads/)."
+case "$(uname -s 2>/dev/null || echo unknown)" in
+  Darwin) : ;;
+  *) say "  note: the auto-open window targets macOS + Terminal.app; games still play anywhere." ;;
 esac
 
-# --------------------------------------------------------------------------- #
-# Selftest (abort if broken — never enable hooks on a bad build)
-# --------------------------------------------------------------------------- #
-echo
-echo "==> Running selftest"
-if ! "$DEST" selftest; then
-  echo
-  echo "error: selftest failed — not enabling hooks. See output above." >&2
-  exit 1
+# --- fetch the tokenop script (local copy if present, else download) ------- #
+mkdir -p "$BIN_DIR"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0" 2>/dev/null || echo .)" 2>/dev/null && pwd || echo "")"
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/tokenop" ]; then
+  say "==> Installing tokenop (local checkout)"
+  cp "$SCRIPT_DIR/tokenop" "$DEST"
+else
+  say "==> Downloading tokenop"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$RAW/tokenop" -o "$DEST" || die "download failed ($RAW/tokenop)"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$DEST" "$RAW/tokenop" || die "download failed ($RAW/tokenop)"
+  else
+    die "need curl or wget to download tokenop"
+  fi
+fi
+chmod +x "$DEST"
+say "    installed to $DEST"
+
+# --- self-test (never enable a broken build) ------------------------------- #
+say "==> Self-test"
+if ! "$DEST" selftest >/dev/null 2>&1; then
+  "$DEST" selftest || true
+  die "self-test failed — not enabling hooks."
+fi
+say "    ok"
+
+# --- enable the Claude Code hooks (opt out with TOKENOP_NO_ENABLE=1) -------- #
+if [ "${TOKENOP_NO_ENABLE:-0}" = "1" ]; then
+  say "==> Skipping hook setup (TOKENOP_NO_ENABLE=1). Run 'tokenop enable' when ready."
+else
+  say "==> Enabling Claude Code hooks (reversible with 'tokenop disable')"
+  "$DEST" enable >/dev/null 2>&1 || say "    (could not edit ~/.claude/settings.json — run 'tokenop enable' manually)"
 fi
 
-# --------------------------------------------------------------------------- #
-# Enable hooks (default mode: every-prompt) + show status
-# --------------------------------------------------------------------------- #
-echo
-echo "==> Enabling Claude Code hooks (mode: every-prompt)"
-"$DEST" enable
+# --- PATH check ------------------------------------------------------------ #
+case ":${PATH:-}:" in
+  *":$BIN_DIR:"*) ON_PATH=1 ;;
+  *) ON_PATH=0 ;;
+esac
 
-echo
-echo "==> Status"
-"$DEST" status
-
-# --------------------------------------------------------------------------- #
-# Final tips
-# --------------------------------------------------------------------------- #
-cat <<EOF
-
-==> Done. tokenop is installed — welcome to the Token Op Arcade.
-
-Play now:
-  tokenop                 open the menu (game selector)
-  tokenop play snake      play a specific game (dino|snake|pong|flappy)
-
-Change the pop-up game:
-  tokenop set <game>      (or 'tokenop set menu' for the selector)
-
-Switch modes:
-  tokenop enable --mode session       # open on prompt; window stays open
-  tokenop enable --mode every-prompt  # open on prompt, close on stop (default)
-
-Uninstall:
-  tokenop disable && rm -f "$DEST"
-  # or: ./install.sh --uninstall
-EOF
+say ""
+say "Done. Welcome to the Token Op Arcade."
+say ""
+if [ "$ON_PATH" = "0" ]; then
+  say "  $BIN_DIR isn't on your PATH yet. Add this to your shell rc:"
+  say "      export PATH=\"\$HOME/.local/bin:\$PATH\""
+  say "  then open a new shell, or run with the full path: $DEST"
+  say ""
+fi
+say "  tokenop                 open the game selector"
+say "  tokenop play pong       play a game (dino | snake | pong | flappy)"
+say "  tokenop disable         turn off auto-open"
+say ""

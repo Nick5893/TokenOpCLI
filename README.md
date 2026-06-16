@@ -7,12 +7,22 @@ A tiny **Claude Code spinner companion**: `dino`, `snake`, `pong`, `flappy` — 
 ## Install
 
 ```sh
-git clone https://github.com/Nick5893/TokenOpCLI.git
-cd TokenOpCLI
-bash install.sh
+curl -fsSL https://raw.githubusercontent.com/Nick5893/TokenOpCLI/main/install.sh | sh
 ```
 
-This copies the single-file `tokenop` to `~/.local/bin`, runs a self-test, and enables the auto-open hook. (A `curl … | sh` one-liner is coming once tokenop.dev is live.)
+Once **tokenop.dev** is live, the prettier form works too:
+
+```sh
+curl -fsSL https://tokenop.dev/install.sh | sh
+```
+
+Or clone and run it locally:
+
+```sh
+git clone https://github.com/Nick5893/TokenOpCLI.git && cd TokenOpCLI && sh install.sh
+```
+
+The installer downloads the single-file `tokenop` to `~/.local/bin`, runs a self-test, and enables the auto-open hook. It's reversible (`tokenop disable`), and you can install without enabling via `TOKENOP_NO_ENABLE=1`, change the location with `TOKENOP_BIN_DIR=…`, or remove everything with `… /install.sh --uninstall`.
 
 ## Play
 

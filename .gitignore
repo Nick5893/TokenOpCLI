@@ -1,0 +1,14 @@
+# Internal build scaffolding — DO NOT publish.
+# reference/ contains a snapshot of the author's real ~/.claude/settings.json;
+# SPEC.md is stale design notes with local paths.
+reference/
+SPEC.md
+
+# Python / OS cruft
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Runtime/user data lives in ~/.config/tokenop and ~/.local/state/tokenop,
+# never in this repo.

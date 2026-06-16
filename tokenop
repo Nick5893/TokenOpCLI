@@ -1,0 +1,3399 @@
+#!/usr/bin/env python3
+"""
+tokenop — the Token Op Arcade.  macOS terminal games + a Claude Code spinner companion.
+
+While Claude Code is thinking, a hook auto-opens your chosen game in a new
+Terminal.app window; when Claude finishes, the window auto-closes (no
+"terminate running process?" prompt). Pick the game that pops up.
+
+Games:    dino · snake · pong · flappy
+
+Commands:
+  tokenop                  interactive menu (or this help when piped)
+  tokenop play <game>      play a game (dino|snake|pong|flappy)
+  tokenop list             list games; marks the configured default
+  tokenop set <game>       set the default pop-up game
+  tokenop config [--show]  show resolved config + path
+  tokenop enable [--mode every-prompt|session]
+                          install Claude Code hooks (merge-safe)
+  tokenop disable          remove tokenop hooks (other settings untouched)
+  tokenop status           hooks/mode, default game, high scores, window, env
+  tokenop doctor           environment checks (PASS/WARN/FAIL)
+  tokenop selftest         headless logic + config + hooks self-test
+  tokenop --help           this overview
+
+Internal hook targets (invoked by Claude Code, fail-soft):
+  tokenop open             open the configured pop-up (game or selector) in a new window
+  tokenop close            kill the game + close its window cleanly
+
+Env overrides (so tests never touch real files):
+  TOKENOP_CONFIG_DIR        default ~/.config/tokenop        (config.json)
+  TOKENOP_STATE_DIR         default ~/.local/state/tokenop   (window.id, *.pid,
+                                                            highscores.json,
+                                                            hook.log)
+  TOKENOP_CLAUDE_SETTINGS   default ~/.claude/settings.json (enable/disable edit
+                                                            this file)
+
+Install / uninstall:
+  ./install.sh            copy to ~/.local/bin, selftest, enable, status
+  ./install.sh --uninstall
+"""
+
+import os
+import sys
+import time
+import json
+import random
+import tempfile
+import subprocess
+import signal
+import shutil
+import textwrap
+from collections import deque
+from pathlib import Path
+
+# Belt-and-suspenders: curses reads ESCDELAY from the environment at init time
+# to decide how long to wait after a bare ESC before treating it as a literal
+# Escape. The default (~1000ms) makes arrow keys (ESC-prefixed sequences) lag
+# almost a full second. Set a snappy default *before* any curses init; the
+# shared input-setup helper also calls curses.set_escdelay(25) at runtime.
+os.environ.setdefault("ESCDELAY", "25")
+
+HELP_OVERVIEW = __doc__
+
+
+# --------------------------------------------------------------------------- #
+# Paths & env overrides
+# --------------------------------------------------------------------------- #
+def config_dir():
+    return Path(os.environ.get("TOKENOP_CONFIG_DIR", "~/.config/tokenop")).expanduser()
+
+
+def state_dir():
+    return Path(os.environ.get("TOKENOP_STATE_DIR", "~/.local/state/tokenop")).expanduser()
+
+
+def claude_settings_path():
+    return Path(
+        os.environ.get("TOKENOP_CLAUDE_SETTINGS", "~/.claude/settings.json")
+    ).expanduser()
+
+
+def config_path():
+    return config_dir() / "config.json"
+
+
+def window_id_path():
+    return state_dir() / "window.id"
+
+
+def pid_path(game):
+    return state_dir() / f"{game}.pid"
+
+
+def highscores_path():
+    return state_dir() / "highscores.json"
+
+
+def hook_log_path():
+    return state_dir() / "hook.log"
+
+
+# Absolute path the hooks always call (NOT sys.argv[0], which may be relative
+# or a temp path during tests).
+TOKENOP_BIN = str(Path("~/.local/bin/tokenop").expanduser())
+
+
+def _ensure_dir(path):
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# Atomic / defensive file I/O
+# --------------------------------------------------------------------------- #
+def _atomic_write_text(path, text):
+    path = Path(path)
+    _ensure_dir(path.parent)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=".swp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        raise
+
+
+def _atomic_write_json(path, obj):
+    _atomic_write_text(path, json.dumps(obj, indent=2) + "\n")
+
+
+def _read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+# --------------------------------------------------------------------------- #
+# Shared curses input setup
+# --------------------------------------------------------------------------- #
+def setup_input(stdscr, curses_mod, nodelay=True):
+    """Configure curses input for snappy, responsive controls.
+
+    Used by every game runner AND the menu so behaviour is identical
+    everywhere. The critical fix is ``set_escdelay(25)``: without it curses
+    waits ~1s after a bare ESC before yielding the key, which makes arrow keys
+    (ESC-prefixed escape sequences) feel laggy/unresponsive in EVERY game.
+
+    - ``set_escdelay(25)``  — collapse the ESC ambiguity window to 25ms.
+    - ``curs_set(0)``       — hide the cursor.
+    - ``stdscr.nodelay(b)`` — non-blocking input for real-time games (the menu
+                              passes nodelay=False since it blocks on getch).
+    - ``stdscr.keypad(True)`` — decode arrows/function keys into KEY_* codes.
+
+    Pure-ish + headless-testable: pass a fake ``stdscr`` and a recording
+    ``curses_mod`` to assert the right calls are made. Guarded so an older
+    curses without ``set_escdelay`` degrades gracefully.
+    """
+    try:
+        curses_mod.set_escdelay(25)
+    except Exception:
+        # AttributeError on very old curses; any other error must not crash
+        # input setup (the env-var ESCDELAY default still applies).
+        pass
+    try:
+        curses_mod.curs_set(0)
+    except Exception:
+        pass
+    stdscr.nodelay(bool(nodelay))
+    stdscr.keypad(True)
+
+
+# --------------------------------------------------------------------------- #
+# Shared curses UI helper
+# --------------------------------------------------------------------------- #
+class CursesUI:
+    """Clip-safe drawing helpers shared by every game (ported from dino.py)."""
+
+    def __init__(self, stdscr):
+        import curses
+
+        self.curses = curses
+        self.stdscr = stdscr
+        self.H, self.W = stdscr.getmaxyx()
+        self._idx = {}
+        self._has_color = False
+        self._setup_color()
+
+    def _setup_color(self):
+        curses = self.curses
+        try:
+            if not curses.has_colors():
+                return
+            curses.start_color()
+            try:
+                curses.use_default_colors()
+                bg = -1
+            except curses.error:
+                bg = curses.COLOR_BLACK
+            pairs = {
+                "green": curses.COLOR_GREEN,
+                "magenta": curses.COLOR_MAGENTA,
+                "white": curses.COLOR_WHITE,
+                "cyan": curses.COLOR_CYAN,
+                "blue": curses.COLOR_BLUE,
+                "yellow": curses.COLOR_YELLOW,
+                "red": curses.COLOR_RED,
+            }
+            for i, (name, fg) in enumerate(pairs.items(), start=1):
+                try:
+                    curses.init_pair(i, fg, bg)
+                    self._idx[name] = i
+                except curses.error:
+                    pass
+            self._has_color = True
+        except curses.error:
+            self._has_color = False
+
+    def resize(self):
+        self.H, self.W = self.stdscr.getmaxyx()
+
+    def color(self, name, *attrs):
+        a = 0
+        if self._has_color and name in self._idx:
+            a = self.curses.color_pair(self._idx[name])
+        for x in attrs:
+            a |= x
+        return a
+
+    def put(self, y, x, s, attr=0):
+        H, W = self.H, self.W
+        if y < 0 or y >= H:
+            return
+        for i, ch in enumerate(s):
+            xx = x + i
+            if xx < 0 or xx >= W:
+                continue
+            if y == H - 1 and xx == W - 1:
+                continue
+            try:
+                self.stdscr.addstr(y, xx, ch, attr)
+            except self.curses.error:
+                pass
+
+    def blit(self, sprite, top, left, attr=0):
+        for r, row in enumerate(sprite):
+            for c, ch in enumerate(row):
+                if ch != " ":
+                    self.put(top + r, left + c, ch, attr)
+
+    def center(self, y, s, attr=0):
+        self.put(y, max(0, (self.W - len(s)) // 2), s, attr)
+
+    def too_small(self, min_w, min_h):
+        return self.W < min_w or self.H < min_h
+
+    def draw_too_small(self, min_w, min_h):
+        self.center(self.H // 2, "Terminal too small", self.curses.A_BOLD)
+        self.center(self.H // 2 + 1, f"need {min_w}x{min_h}, have {self.W}x{self.H}")
+
+
+# --------------------------------------------------------------------------- #
+# High-score persistence (shared file, keyed by game id)
+# --------------------------------------------------------------------------- #
+def load_high(game):
+    data = _read_json(highscores_path(), {})
+    try:
+        return int(data.get(game, 0))
+    except Exception:
+        return 0
+
+
+def save_high(game, v):
+    try:
+        data = _read_json(highscores_path(), {})
+        if not isinstance(data, dict):
+            data = {}
+        try:
+            cur = int(data.get(game, 0))
+        except Exception:
+            cur = 0
+        v = int(v)
+        if v > cur:
+            data[game] = v
+            _atomic_write_json(highscores_path(), data)
+        return data.get(game, v)
+    except Exception:
+        return v
+
+
+# =========================================================================== #
+# GAME: dino — T-Rex runner (ported from reference/dino.py)
+# =========================================================================== #
+DINO_FPS = 30
+# Feel/fairness fix: the old jump (JUMP_V=1.5, GRAVITY=0.18) gave only ~8 frames
+# of clearance height but the widest cactus stays alongside the 8-wide dino for
+# ~24 frames at base speed — so a normal jump literally could NOT clear it ("can't
+# jump over things"). A bigger, floatier arc (more HANG TIME) clears the tallest
+# cactus with margin across a WIDE, forgiving window of press timings.
+DINO_GRAVITY = 0.13          # was 0.18 (gentler fall = more hang time)
+DINO_JUMP_V = 1.9            # was 1.5  (airtime 2*JUMP_V/GRAVITY ≈ 29 frames)
+DINO_FASTFALL = 0.55
+DINO_BASE_SPEED = 0.50       # was 0.55 (a touch slower = more reaction time)
+DINO_MAX_SPEED = 1.45        # was 1.6  (keeps high-speed obstacles clearable)
+DINO_SPEED_RAMP = 0.00022    # was 0.00025 (ramps a little gentler)
+# The above give a forgiving clearance window for the WIDEST cactus: clearable
+# across many press timings (~4 frames at base speed, widening to ~19 at top
+# speed) rather than the near-1-frame-perfect (often impossible) window the old
+# physics demanded. Jump buffering + coyote time absorb further timing slop.
+DINO_X = 5
+DINO_DUCK_HOLD = 0.28
+NIGHT_CYCLE = 1400
+BIRD_AFTER = 650
+RESTART_LOCK = 0.5
+# Feel: a jump pressed a frame or two before landing is REMEMBERED for this
+# long and auto-fires the instant the dino lands (jump buffering). And for a
+# brief moment after walking off the ground you can still jump (coyote time).
+# Together these kill the #1 "I pressed jump and nothing happened" complaint.
+DINO_JUMP_BUFFER = 0.12
+DINO_COYOTE = 0.08
+
+DINO_MIN_W, DINO_MIN_H = 46, 16
+
+DINO_RUN = [
+    [
+        "   ▄███▄",
+        "   █ ███",
+        "▄  █████",
+        "████████",
+        "  ██ █  ",
+    ],
+    [
+        "   ▄███▄",
+        "   █ ███",
+        "▄  █████",
+        "████████",
+        "  █  ██ ",
+    ],
+]
+DINO_DUCK = [
+    [
+        "     ▄▄▄ ",
+        "████████▄",
+        "  ██ █   ",
+    ],
+    [
+        "     ▄▄▄ ",
+        "████████▄",
+        "  █  ██  ",
+    ],
+]
+DINO_DEAD = [
+    "   ▄███▄",
+    "   █ █X█",
+    "▄  █████",
+    "████████",
+    "  █  █  ",
+]
+
+CACTI = [
+    [
+        " █ ",
+        "███",
+        " █ ",
+    ],
+    [
+        " █ ",
+        " █ ",
+        "███",
+        " █ ",
+    ],
+    [
+        " █ █ ",
+        " █ █ ",
+        "█████",
+        " █ █ ",
+    ],
+    [
+        "  █ ",
+        "█▄█ ",
+        " ██ ",
+        " █  ",
+    ],
+]
+
+BIRD = [
+    [
+        "▄▄▄   ",
+        "   ▀██",
+    ],
+    [
+        "   ▄██",
+        "▀▀▀   ",
+    ],
+]
+
+CLOUD = [
+    " ▄▄▄ ",
+    "█████",
+]
+SUN = [
+    " ▄▄ ",
+    "████",
+    "████",
+    " ▀▀ ",
+]
+MOON = [
+    " ▄▄ ",
+    "████",
+    " ▀▀ ",
+]
+
+
+def _sprite_w(sp):
+    return max((len(r) for r in sp), default=0)
+
+
+def _cells(sp, top, left):
+    """Yield absolute (row, col) for every solid (non-space) cell of a sprite."""
+    for r, row in enumerate(sp):
+        for c, ch in enumerate(row):
+            if ch != " ":
+                yield (top + r, left + c)
+
+
+def _eroded_cells(sp, top, left):
+    """Forgiving (inset-by-~1) hitbox: the sprite's solid cells minus thin
+    protrusions/corners (any cell with <2 solid orthogonal neighbours within
+    the sprite). This means a near-miss that only grazes a single-pixel spike
+    or corner of the dino isn't an unfair death, while the solid body still
+    collides honestly. Falls back to the full cell set for tiny sprites so we
+    never produce an empty hitbox."""
+    local = set()
+    for r, row in enumerate(sp):
+        for c, ch in enumerate(row):
+            if ch != " ":
+                local.add((r, c))
+    eroded = set()
+    for (r, c) in local:
+        n = sum((nr, nc) in local
+                for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)))
+        if n >= 2:
+            eroded.add((r, c))
+    if not eroded:
+        eroded = local
+    return {(top + r, left + c) for (r, c) in eroded}
+
+
+class DinoGame:
+    """T-Rex runner logic — no curses calls, runs headless."""
+
+    def __init__(self, w, h, seed=None):
+        self.rng = random.Random(seed)
+        self.set_size(w, h)
+        self.reset()
+
+    def set_size(self, w, h):
+        self.w = w
+        self.h = h
+        self.ground = h - 2
+        self._make_scenery()
+
+    def _make_scenery(self):
+        self.stars = []
+        for _ in range(max(8, self.w // 7)):
+            y = self.rng.randint(1, max(1, self.ground - 4))
+            x = self.rng.randint(0, max(1, self.w - 1))
+            self.stars.append((y, x, self.rng.choice("..*+·")))
+
+    def reset(self):
+        self.state = "title"
+        self.foot = float(self.ground - 1)
+        self.vy = 0.0
+        self.on_ground = True
+        # Jump-feel bookkeeping (buffering + coyote time).
+        self.jump_buffered_until = -1.0   # a press is honoured until this time
+        self.left_ground_at = -1.0        # when on_ground last became False
+        self._jumped_this_air = False     # guard so coyote can't double-jump
+        self.duck_until = 0.0
+        self.obstacles = []
+        self.clouds = []
+        self.pebbles = []
+        self.distance = 0.0
+        self.speed = DINO_BASE_SPEED
+        self.next_gap = 30.0
+        self.high = load_high("dino")
+        self.gameover_at = 0.0
+        self.flash = 0
+        self.frame = 0
+
+    def _can_jump(self, now):
+        """True if a jump may fire right now: on the ground, or still within
+        coyote time after leaving it (and we haven't already jumped this air)."""
+        if self.on_ground:
+            return True
+        if (not self._jumped_this_air
+                and self.left_ground_at >= 0
+                and (now - self.left_ground_at) <= DINO_COYOTE):
+            return True
+        return False
+
+    def _do_jump(self, now):
+        self.vy = -DINO_JUMP_V
+        self.on_ground = False
+        self._jumped_this_air = True
+        self.left_ground_at = now
+        self.jump_buffered_until = -1.0  # consumed
+
+    def request_jump(self, now):
+        """Ask to jump. Fires immediately if allowed (ground/coyote); otherwise
+        the request is BUFFERED and auto-fires on landing within the window."""
+        if self.state != "playing":
+            return
+        if self._can_jump(now):
+            self._do_jump(now)
+        else:
+            # Airborne too long for coyote: remember the press briefly so it
+            # fires the instant we touch down (jump buffering).
+            self.jump_buffered_until = now + DINO_JUMP_BUFFER
+
+    def jump(self, now=None):
+        """Backward-compatible alias. With no clock, uses time.monotonic()."""
+        self.request_jump(time.monotonic() if now is None else now)
+
+    def duck(self, now):
+        if self.state == "playing":
+            self.duck_until = now + DINO_DUCK_HOLD
+
+    @property
+    def ducking(self):
+        return time.monotonic() < self.duck_until if self.state == "playing" else False
+
+    def start_or_restart(self, now):
+        if self.state in ("title", "gameover"):
+            if self.state == "gameover" and now - self.gameover_at < RESTART_LOCK:
+                return
+            keep_high = self.high
+            self.reset()
+            self.high = keep_high
+            self.state = "playing"
+
+    def toggle_pause(self):
+        if self.state == "playing":
+            self.state = "paused"
+        elif self.state == "paused":
+            self.state = "playing"
+
+    def dino_sprite(self):
+        if self.state == "gameover":
+            return DINO_DEAD
+        anim = int(self.distance / 2) % 2
+        if self.ducking and self.on_ground:
+            return DINO_DUCK[anim]
+        return DINO_RUN[anim]
+
+    def dino_box(self):
+        sp = self.dino_sprite()
+        h = len(sp)
+        top = int(round(self.foot)) - (h - 1)
+        return sp, top, DINO_X
+
+    def update(self, now):
+        if self.state != "playing":
+            return
+        self.frame += 1
+
+        self.speed = min(DINO_MAX_SPEED, DINO_BASE_SPEED + self.distance * DINO_SPEED_RAMP)
+        prev = int(self.distance)
+        self.distance += self.speed
+        if int(self.distance) // 100 != prev // 100:
+            self.flash = 12
+
+        was_on_ground = self.on_ground
+        if not self.on_ground:
+            self.vy += DINO_GRAVITY
+            if self.ducking:
+                self.vy += DINO_FASTFALL
+            self.foot += self.vy
+            if self.foot >= self.ground - 1:
+                self.foot = float(self.ground - 1)
+                self.vy = 0.0
+                self.on_ground = True
+                self._jumped_this_air = False
+                # Consume a buffered jump if the press is still fresh — this is
+                # what makes a slightly-early press "just work" on landing.
+                if self.jump_buffered_until >= 0 and now <= self.jump_buffered_until:
+                    self._do_jump(now)
+
+        # Stamp leaving the ground for coyote when it happens *outside* a jump
+        # (e.g. walking off a ledge / on_ground forced False externally).
+        # _do_jump already stamps left_ground_at for real jumps.
+        if was_on_ground and not self.on_ground and not self._jumped_this_air:
+            self.left_ground_at = now
+
+        self._spawn()
+        self._move()
+        if self.flash:
+            self.flash -= 1
+        self._collide()
+
+    def _spawn(self):
+        rightmost = self.obstacles[-1]["x"] if self.obstacles else -1e9
+        if not self.obstacles or (self.w - rightmost) >= self.next_gap:
+            self.obstacles.append(self._new_obstacle())
+            # Gap scales with how far the dino travels during one full jump arc,
+            # so reaction time stays comfortable at EVERY speed. A higher floor
+            # and a slightly larger minimum multiplier remove the occasional
+            # too-tight spawn right after a speed bump.
+            airtime = 2 * DINO_JUMP_V / DINO_GRAVITY
+            air_cols = airtime * self.speed
+            self.next_gap = max(22.0, air_cols * self.rng.uniform(1.4, 2.8) + 8)
+
+        if self.rng.random() < 0.012 and len(self.clouds) < 4:
+            self.clouds.append([float(self.w), self.rng.randint(1, max(1, self.ground // 2))])
+        if self.rng.random() < 0.08:
+            self.pebbles.append([float(self.w), self.rng.choice("▄▖.,")])
+
+    def _new_obstacle(self):
+        if self.distance > BIRD_AFTER and self.rng.random() < 0.32:
+            sp = BIRD[0]
+            if self.rng.random() < 0.5:
+                top = self.ground - 5
+            else:
+                top = self.ground - 2
+            return {"x": float(self.w + 1), "sprite": sp, "kind": "bird", "top": top}
+        sp = self.rng.choice(CACTI)
+        return {"x": float(self.w + 1), "sprite": sp, "kind": "cactus",
+                "top": self.ground - len(sp)}
+
+    def _move(self):
+        for o in self.obstacles:
+            o["x"] -= self.speed
+        self.obstacles = [o for o in self.obstacles
+                          if o["x"] + _sprite_w(o["sprite"]) >= 0]
+        for c in self.clouds:
+            c[0] -= self.speed * 0.35
+        self.clouds = [c for c in self.clouds if c[0] + _sprite_w(CLOUD) >= 0]
+        for p in self.pebbles:
+            p[0] -= self.speed
+        self.pebbles = [p for p in self.pebbles if p[0] >= 0]
+
+    def _collide(self):
+        sp, top, left = self.dino_box()
+        # Forgiving dino hitbox (eroded by ~1) so a wing/spike near-miss isn't
+        # an unfair death; obstacles keep their full honest footprint.
+        dino = _eroded_cells(sp, top, left)
+        for o in self.obstacles:
+            ox = int(round(o["x"]))
+            if ox > DINO_X + _sprite_w(sp) + 1 or ox + _sprite_w(o["sprite"]) < DINO_X - 1:
+                continue
+            spr = o["sprite"]
+            if o["kind"] == "bird":
+                spr = BIRD[int(self.distance / 3) % 2]
+            if dino & set(_cells(spr, o["top"], ox)):
+                self._die()
+                return
+
+    def _die(self):
+        self.state = "gameover"
+        self.gameover_at = time.monotonic()
+        if int(self.distance) > self.high:
+            self.high = int(self.distance)
+            save_high("dino", self.high)
+
+    @property
+    def score(self):
+        return int(self.distance)
+
+
+def run_dino(stdscr):
+    import curses
+
+    ui = CursesUI(stdscr)
+    setup_input(stdscr, curses)
+
+    H, W = ui.H, ui.W
+    game = DinoGame(W, H)
+
+    def draw():
+        stdscr.erase()
+        nonlocal H, W
+        ui.resize()
+        H, W = ui.H, ui.W
+
+        if ui.too_small(DINO_MIN_W, DINO_MIN_H):
+            ui.draw_too_small(DINO_MIN_W, DINO_MIN_H)
+            stdscr.refresh()
+            return
+
+        is_night = int(game.distance / NIGHT_CYCLE) % 2 == 1
+
+        if is_night:
+            for (sy, sx, ch) in game.stars:
+                ui.put(sy, sx, ch, ui.color("blue", curses.A_DIM))
+            ui.blit(MOON, 1, W - 7, ui.color("yellow", curses.A_DIM))
+        else:
+            ui.blit(SUN, 1, W - 8, ui.color("yellow", curses.A_BOLD))
+            for (cx, cy) in game.clouds:
+                ui.blit(CLOUD, cy, int(cx), ui.color("white", curses.A_DIM))
+
+        ui.put(game.ground, 0, "─" * (W - 1), ui.color("white", curses.A_DIM))
+        for (px, ch) in game.pebbles:
+            ui.put(game.ground + 1, int(px), ch, ui.color("white", curses.A_DIM))
+
+        for o in game.obstacles:
+            if o["kind"] == "bird":
+                spr = BIRD[int(game.distance / 3) % 2]
+                ui.blit(spr, o["top"], int(round(o["x"])), ui.color("magenta", curses.A_BOLD))
+            else:
+                ui.blit(o["sprite"], o["top"], int(round(o["x"])), ui.color("green"))
+
+        sp, top, left = game.dino_box()
+        datt = (ui.color("green", curses.A_BOLD) if game.state != "gameover"
+                else ui.color("red", curses.A_BOLD))
+        ui.blit(sp, top, left, datt)
+
+        score_attr = ui.color("cyan", curses.A_BOLD)
+        if game.flash and (game.frame // 3) % 2 == 0:
+            score_attr = ui.color("yellow", curses.A_BOLD)
+        hud = f"HI {game.high:05d}   {game.score:05d}"
+        ui.put(0, max(0, W - len(hud) - 1), hud, score_attr)
+        ui.put(0, 1, "dino", ui.color("green"))
+
+        if game.state == "title":
+            ui.blit(DINO_RUN[0], game.ground - 1 - 5, DINO_X, ui.color("green", curses.A_BOLD))
+            cy = H // 2 - 2
+            ui.center(cy,     "T - R E X   R U N N E R", ui.color("green", curses.A_BOLD))
+            ui.center(cy + 2, "SPACE / ↑  jump      ↓  duck")
+            ui.center(cy + 3, "p  pause             q  quit")
+            ui.center(cy + 5, "press SPACE to run", ui.color("cyan", curses.A_BOLD))
+        elif game.state == "paused":
+            ui.center(H // 2, "  P A U S E D  ", ui.color("cyan", curses.A_BOLD | curses.A_REVERSE))
+            ui.center(H // 2 + 1, "p to resume")
+        elif game.state == "gameover":
+            cy = H // 2 - 2
+            ui.center(cy,     "  G A M E   O V E R  ", ui.color("red", curses.A_BOLD | curses.A_REVERSE))
+            ui.center(cy + 2, f"score {game.score:05d}    best {game.high:05d}", ui.color("cyan"))
+            if game.score >= game.high and game.score > 0:
+                ui.center(cy + 3, "★ new best! ★", ui.color("yellow", curses.A_BOLD))
+            ui.center(cy + 5, "SPACE restart   ·   q quit")
+
+        stdscr.refresh()
+
+    frame_dt = 1.0 / DINO_FPS
+    next_t = time.perf_counter()
+    running = True
+    try:
+        while running:
+            now = time.monotonic()
+            h, w = stdscr.getmaxyx()
+            if (h, w) != (H, W):
+                H, W = h, w
+                game.set_size(W, H)
+                game.foot = min(game.foot, game.ground - 1)
+
+            while True:
+                c = stdscr.getch()
+                if c == -1:
+                    break
+                if c in (ord("q"), ord("Q")):
+                    running = False
+                elif c in (ord(" "), curses.KEY_UP, ord("w"), ord("k")):
+                    if game.state in ("title", "gameover"):
+                        game.start_or_restart(now)
+                    else:
+                        game.request_jump(now)
+                elif c in (curses.KEY_DOWN, ord("s"), ord("j")):
+                    game.duck(now)
+                elif c in (ord("p"), ord("P")):
+                    game.toggle_pause()
+                elif c == curses.KEY_RESIZE:
+                    pass
+
+            game.update(now)
+            draw()
+
+            next_t += frame_dt
+            slack = next_t - time.perf_counter()
+            if slack > 0:
+                time.sleep(slack)
+            else:
+                next_t = time.perf_counter()
+    except KeyboardInterrupt:
+        pass
+
+
+def selftest_dino(check):
+    g = DinoGame(100, 30, seed=7)
+    g.state = "playing"
+    crashed_frame = None
+    t = 0.0
+    for i in range(4000):
+        t += 1 / DINO_FPS
+        g.update(t)
+        if g.state == "gameover":
+            crashed_frame = i
+            break
+    check(crashed_frame is not None, "dino: never-jumping dino eventually crashes")
+    check(g.high >= g.score and g.high > 0, "dino: high score recorded on crash")
+
+    g2 = DinoGame(100, 30, seed=3)
+    g2.state = "playing"
+    g2._collide = lambda: None
+    saw_obstacle = saw_cull = saw_bird = False
+    t = 0.0
+    for i in range(2500):
+        t += 1 / DINO_FPS
+        before = len(g2.obstacles)
+        g2.update(t)
+        if g2.obstacles:
+            saw_obstacle = True
+        if any(o["kind"] == "bird" for o in g2.obstacles):
+            saw_bird = True
+        if len(g2.obstacles) < before:
+            saw_cull = True
+    check(saw_obstacle, "dino: obstacles spawn")
+    check(saw_cull, "dino: off-screen obstacles get culled")
+    check(saw_bird, "dino: birds appear past the score threshold")
+    check(g2.speed > DINO_BASE_SPEED, "dino: speed ramps up over distance")
+    check(g2.speed <= DINO_MAX_SPEED + 1e-9, "dino: speed stays capped")
+
+    g3 = DinoGame(100, 30, seed=1)
+    g3.state = "playing"
+    t = 0.0
+    g3.request_jump(t)
+    peak = g3.foot
+    for _ in range(60):
+        t += 1 / DINO_FPS
+        g3.update(t)
+        peak = min(peak, g3.foot)
+        if g3.on_ground:
+            break
+    rise = (g3.ground - 1) - peak
+    tallest = max(len(c) for c in CACTI)
+    check(rise > tallest + 1, f"dino: jump height ({rise:.1f}) clears tallest cactus ({tallest})")
+
+    save_high("dino", 4242)
+    check(load_high("dino") == 4242, "dino: high score persists via save_high/load_high")
+
+    g4 = DinoGame(100, 30, seed=9)
+    g4.state = "gameover"
+    g4.gameover_at = time.monotonic()
+    g4.start_or_restart(time.monotonic())
+    check(g4.state == "gameover", "dino: restart is locked briefly after a crash")
+    g4.start_or_restart(time.monotonic() + RESTART_LOCK + 0.1)
+    check(g4.state == "playing", "dino: restart works after the lock expires")
+
+    # --- Jump buffering: a press while airborne fires automatically on landing
+    # if it's within the buffer window. ---
+    dt = 1 / DINO_FPS
+    gb = DinoGame(100, 30, seed=1)
+    gb.state = "playing"
+    t = 0.0
+    gb.request_jump(t)            # initial jump from the ground
+    # Find the landing frame so we can press exactly one frame before it.
+    hist = []
+    while True:
+        t += dt
+        gb.update(t)
+        hist.append((round(t, 6), gb.on_ground))
+        if gb.on_ground or len(hist) > 200:
+            break
+    land_t = next(tt for tt, og in hist if og)
+    press_t = land_t - dt          # one frame before landing => inside buffer
+
+    gb2 = DinoGame(100, 30, seed=1)
+    gb2.state = "playing"
+    t = 0.0
+    gb2.request_jump(t)
+    pressed = False
+    airborne_after_land = None
+    while True:
+        t += dt
+        if not pressed and t >= press_t - 1e-9:
+            gb2.request_jump(t)    # buffered press (airborne)
+            pressed = True
+        landed_before = gb2.on_ground
+        gb2.update(t)
+        # The frame we land, the buffer should fire -> we go airborne again.
+        if pressed and not landed_before and gb2.on_ground is False and t >= land_t - 1e-9:
+            airborne_after_land = True
+            break
+        if t > land_t + 0.5:
+            airborne_after_land = bool(not gb2.on_ground)
+            break
+    check(airborne_after_land is True,
+          "dino: buffered jump (pressed just before landing) auto-fires on landing")
+
+    # A press OLDER than the buffer window must NOT fire on landing.
+    gb3 = DinoGame(100, 30, seed=1)
+    gb3.state = "playing"
+    t = 0.0
+    gb3.request_jump(t)
+    stale_press_t = 2 * dt         # very early in the arc (>> buffer before landing)
+    pressed = False
+    while True:
+        t += dt
+        if not pressed and t >= stale_press_t - 1e-9:
+            gb3.request_jump(t)    # stale press
+            pressed = True
+        gb3.update(t)
+        if gb3.on_ground and t > land_t + 1e-9:
+            break
+        if t > land_t + 1.0:
+            break
+    check(gb3.on_ground is True,
+          "dino: a press older than the buffer window does NOT re-fire on landing")
+
+    # --- Coyote time: just after leaving the ground you can still jump. ---
+    gc = DinoGame(100, 30, seed=1)
+    gc.state = "playing"
+    gc.on_ground = False
+    gc.left_ground_at = 0.0
+    gc._jumped_this_air = False
+    gc.foot = float(gc.ground - 1)
+    gc.request_jump(DINO_COYOTE * 0.5)     # within coyote
+    check(gc.vy < 0,
+          "dino: coyote time lets you jump just after walking off the ground")
+    gc2 = DinoGame(100, 30, seed=1)
+    gc2.state = "playing"
+    gc2.on_ground = False
+    gc2.left_ground_at = 0.0
+    gc2._jumped_this_air = False
+    gc2.request_jump(DINO_COYOTE + 0.05)   # past coyote -> buffered, not fired
+    check(gc2.vy == 0.0 and gc2.jump_buffered_until > 0,
+          "dino: past coyote a jump is buffered, not fired immediately")
+
+
+# =========================================================================== #
+# GAME: snake
+# =========================================================================== #
+SNAKE_BASE_INT = 0.12
+SNAKE_MIN_INT = 0.045
+SNAKE_STEP = 0.004
+SNAKE_MIN_W, SNAKE_MIN_H = 24, 12
+
+DIRS = {
+    "up": (0, -1),
+    "down": (0, 1),
+    "left": (-1, 0),
+    "right": (1, 0),
+}
+
+
+class SnakeGame:
+    """Snake logic — pure, no curses."""
+
+    def __init__(self, gw, gh, seed=None):
+        self.rng = random.Random(seed)
+        self.set_size(gw, gh)
+        self.reset()
+
+    def set_size(self, gw, gh):
+        self.gw = max(8, gw)
+        self.gh = max(6, gh)
+
+    def reset(self):
+        self.state = "title"
+        cx, cy = self.gw // 2, self.gh // 2
+        self.snake = deque([(cx, cy), (cx - 1, cy), (cx - 2, cy)])
+        self.cells = set(self.snake)
+        self.direction = (1, 0)
+        # A short input QUEUE (not a single slot): a fast double-turn within one
+        # tick is preserved and applied across successive steps, and each turn
+        # is validated against the LAST QUEUED direction (so e.g. right→up→left
+        # is all legal and none of it is silently dropped / mis-rejected).
+        self.queue = deque(maxlen=2)
+        self.score = 0
+        self.high = load_high("snake")
+        self.food = None
+        self._place_food()
+
+    def _place_food(self):
+        free = [
+            (x, y)
+            for x in range(self.gw)
+            for y in range(self.gh)
+            if (x, y) not in self.cells
+        ]
+        if not free:
+            self.food = None
+            return
+        self.food = self.rng.choice(free)
+
+    def start_or_restart(self):
+        if self.state in ("title", "gameover"):
+            keep_high = self.high
+            self.reset()
+            self.high = keep_high
+            self.state = "playing"
+
+    def toggle_pause(self):
+        if self.state == "playing":
+            self.state = "paused"
+        elif self.state == "paused":
+            self.state = "playing"
+
+    def _last_intended_dir(self):
+        """The direction the snake will be heading after the queue drains:
+        the last queued turn, or the current direction if the queue is empty."""
+        return self.queue[-1] if self.queue else self.direction
+
+    def set_dir(self, name):
+        if name not in DIRS:
+            return
+        ndx, ndy = DIRS[name]
+        ref_dx, ref_dy = self._last_intended_dir()
+        # Reject a 180° reversal relative to the LAST QUEUED direction (not just
+        # the current moving one) — that's what lets rapid turns chain safely
+        # without ever queuing a move that would fold the snake back on itself.
+        if (ndx, ndy) == (-ref_dx, -ref_dy):
+            return
+        # Ignore a no-op repeat of the pending heading.
+        if (ndx, ndy) == (ref_dx, ref_dy):
+            return
+        self.queue.append((ndx, ndy))
+
+    @property
+    def pending(self):
+        """Back-compat view: the next direction step() will take."""
+        return self.queue[0] if self.queue else self.direction
+
+    @pending.setter
+    def pending(self, value):
+        # Back-compat: setting .pending replaces the queue with this one turn.
+        self.queue.clear()
+        if value != self.direction:
+            self.queue.append(value)
+
+    def interval(self):
+        return max(SNAKE_MIN_INT, SNAKE_BASE_INT - self.score * SNAKE_STEP)
+
+    def step(self):
+        if self.state != "playing":
+            return
+        # Pop the next queued turn, but NEVER apply one that is the 180° reverse
+        # of the CURRENT heading. deque(maxlen=2) eviction can leave a reversal at
+        # the front even though set_dir validated against the last *queued* dir,
+        # so re-validate here — the snake can never fold into its own neck. A
+        # reversal is discarded; the first legal turn this tick is applied,
+        # preserving a buffered double-turn for responsiveness.
+        rev = (-self.direction[0], -self.direction[1])
+        while self.queue:
+            cand = self.queue.popleft()
+            if cand != rev:
+                self.direction = cand
+                break
+        hx, hy = self.snake[0]
+        dx, dy = self.direction
+        nx, ny = hx + dx, hy + dy
+
+        # Wall collision.
+        if nx < 0 or nx >= self.gw or ny < 0 or ny >= self.gh:
+            self._die()
+            return
+
+        eating = (nx, ny) == self.food
+
+        # Self collision. When not eating, the tail moves out of the way this
+        # step, so colliding with the current tail cell is allowed.
+        tail = self.snake[-1]
+        body = self.cells
+        if (nx, ny) in body and not (not eating and (nx, ny) == tail):
+            self._die()
+            return
+
+        self.snake.appendleft((nx, ny))
+        self.cells.add((nx, ny))
+        if eating:
+            self.score += 1
+            self._place_food()
+        else:
+            t = self.snake.pop()
+            self.cells.discard(t)
+
+    def _die(self):
+        self.state = "gameover"
+        if self.score > self.high:
+            self.high = self.score
+            save_high("snake", self.high)
+
+
+def run_snake(stdscr):
+    import curses
+
+    ui = CursesUI(stdscr)
+    setup_input(stdscr, curses)
+
+    def grid_size():
+        return max(8, ui.W - 2), max(6, ui.H - 4)
+
+    ui.resize()
+    gw, gh = grid_size()
+    game = SnakeGame(gw, gh)
+
+    BORDER = {"h": "─", "v": "│", "tl": "┌", "tr": "┐", "bl": "└", "br": "┘"}
+
+    last_step = time.monotonic()
+
+    def draw():
+        stdscr.erase()
+        ui.resize()
+        if ui.too_small(SNAKE_MIN_W, SNAKE_MIN_H):
+            ui.draw_too_small(SNAKE_MIN_W, SNAKE_MIN_H)
+            stdscr.refresh()
+            return
+
+        ox, oy = 1, 2  # board origin (leave HUD row 0)
+        bw, bh = game.gw, game.gh
+
+        # HUD.
+        hud = f"snake   score {game.score}   best {game.high}"
+        ui.put(0, 1, hud, ui.color("cyan", curses.A_BOLD))
+
+        # Border box around the playfield.
+        top = oy - 1
+        left = ox - 1
+        ui.put(top, left, BORDER["tl"] + BORDER["h"] * bw + BORDER["tr"],
+               ui.color("white", curses.A_DIM))
+        for ry in range(bh):
+            ui.put(oy + ry, left, BORDER["v"], ui.color("white", curses.A_DIM))
+            ui.put(oy + ry, ox + bw, BORDER["v"], ui.color("white", curses.A_DIM))
+        ui.put(oy + bh, left, BORDER["bl"] + BORDER["h"] * bw + BORDER["br"],
+               ui.color("white", curses.A_DIM))
+
+        # Food.
+        if game.food is not None:
+            fx, fy = game.food
+            ui.put(oy + fy, ox + fx, "●", ui.color("red", curses.A_BOLD))
+
+        # Snake.
+        for i, (sx, sy) in enumerate(game.snake):
+            if i == 0:
+                ui.put(oy + sy, ox + sx, "█", ui.color("green", curses.A_BOLD))
+            else:
+                ui.put(oy + sy, ox + sx, "▓", ui.color("green"))
+
+        if game.state == "title":
+            cy = (oy + bh // 2)
+            ui.center(cy, "S N A K E", ui.color("green", curses.A_BOLD))
+            ui.center(cy + 2, "arrows / wasd / hjkl  steer")
+            ui.center(cy + 3, "p pause     q quit")
+            ui.center(cy + 5, "press SPACE to play", ui.color("cyan", curses.A_BOLD))
+        elif game.state == "paused":
+            ui.center(oy + bh // 2, "  P A U S E D  ",
+                      ui.color("cyan", curses.A_BOLD | curses.A_REVERSE))
+        elif game.state == "gameover":
+            cy = oy + bh // 2 - 1
+            ui.center(cy, "  G A M E   O V E R  ",
+                      ui.color("red", curses.A_BOLD | curses.A_REVERSE))
+            ui.center(cy + 2, f"score {game.score}    best {game.high}", ui.color("cyan"))
+            if game.score >= game.high and game.score > 0:
+                ui.center(cy + 3, "★ new best! ★", ui.color("yellow", curses.A_BOLD))
+            ui.center(cy + 4, "SPACE restart   ·   q quit")
+
+        stdscr.refresh()
+
+    running = True
+    try:
+        while running:
+            now = time.monotonic()
+            ui.resize()
+            ngw, ngh = grid_size()
+            if (ngw, ngh) != (game.gw, game.gh) and game.state in ("title", "gameover"):
+                game.set_size(ngw, ngh)
+                if game.state == "title":
+                    game.reset()
+
+            while True:
+                c = stdscr.getch()
+                if c == -1:
+                    break
+                if c in (ord("q"), ord("Q")):
+                    running = False
+                elif c in (curses.KEY_UP, ord("w"), ord("k")):
+                    game.set_dir("up")
+                elif c in (curses.KEY_DOWN, ord("s"), ord("j")):
+                    game.set_dir("down")
+                elif c in (curses.KEY_LEFT, ord("a"), ord("h")):
+                    game.set_dir("left")
+                elif c in (curses.KEY_RIGHT, ord("d"), ord("l")):
+                    game.set_dir("right")
+                elif c == ord(" "):
+                    if game.state in ("title", "gameover"):
+                        game.start_or_restart()
+                        last_step = now
+                elif c in (ord("p"), ord("P")):
+                    game.toggle_pause()
+
+            if game.state == "playing" and now - last_step >= game.interval():
+                game.step()
+                last_step = now
+
+            draw()
+            time.sleep(0.01)
+    except KeyboardInterrupt:
+        pass
+
+
+def selftest_snake(check):
+    # 1. Eating food grows length by 1 and increases score by 1.
+    g = SnakeGame(20, 20, seed=1)
+    g.state = "playing"
+    g.direction = (1, 0)
+    g.queue.clear()
+    hx, hy = g.snake[0]
+    g.food = (hx + 1, hy)
+    before_len = len(g.snake)
+    g.step()
+    check(len(g.snake) == before_len + 1 and g.score == 1,
+          "snake: eating food grows length by 1 and score by 1")
+
+    # 2. Running into a wall ends the game.
+    g = SnakeGame(20, 20, seed=2)
+    g.state = "playing"
+    # Head near right wall, moving right.
+    g.snake = deque([(g.gw - 1, 5), (g.gw - 2, 5), (g.gw - 3, 5)])
+    g.cells = set(g.snake)
+    g.direction = (1, 0)
+    g.queue.clear()
+    g.food = (0, 0)
+    g.step()
+    check(g.state == "gameover", "snake: running into a wall ends the game")
+
+    # 3. Running into own body ends the game (length>=5, force U-turn).
+    g = SnakeGame(20, 20, seed=3)
+    g.state = "playing"
+    # Construct a guaranteed self-hit: head (5,5) moving up; turn right into the
+    # body cell (6,5).
+    g.snake = deque([(5, 5), (5, 6), (6, 6), (6, 5), (6, 4)])
+    g.cells = set(g.snake)
+    g.direction = (0, -1)  # moving up
+    g.queue.clear()
+    g.set_dir("right")  # from up, right is allowed -> steps into (6,5) body
+    g.food = (0, 0)
+    g.step()
+    check(g.state == "gameover", "snake: running into own body ends the game")
+
+    # 4. 180-degree reversal is rejected.
+    g = SnakeGame(20, 20, seed=4)
+    g.direction = (1, 0)
+    g.queue.clear()
+    g.set_dir("left")
+    check(g.pending == (1, 0) and len(g.queue) == 0,
+          "snake: 180-degree reversal is rejected")
+
+    # 4b. Input QUEUE: moving right, queue up THEN left within one tick -> both
+    # honored across two successive steps (the first input is not dropped).
+    g = SnakeGame(20, 20, seed=44)
+    g.state = "playing"
+    g.direction = (1, 0)
+    g.queue.clear()
+    g.food = (-1, -1)  # out of the way
+    g.set_dir("up")
+    g.set_dir("left")   # left is legal vs the LAST QUEUED dir (up), not vs right
+    check(list(g.queue) == [(0, -1), (-1, 0)],
+          "snake: rapid double-turn is queued (not collapsed to one)")
+    g.step()
+    d_after_1 = g.direction
+    g.step()
+    d_after_2 = g.direction
+    check(d_after_1 == (0, -1) and d_after_2 == (-1, 0),
+          "snake: queued double-turn applies across two steps")
+
+    # 4c. Rapid OPPOSITE presses never cause an immediate self-reversal/self-kill:
+    # moving right, spam left+right repeatedly, then step -> still alive, never
+    # folds back on itself.
+    g = SnakeGame(20, 20, seed=45)
+    g.state = "playing"
+    g.direction = (1, 0)
+    g.queue.clear()
+    for _ in range(8):
+        g.set_dir("left")   # 180° of right -> rejected
+        g.set_dir("right")  # no-op repeat of heading -> ignored
+    before = g.direction
+    g.step()
+    check(g.state == "playing" and g.direction == (1, 0),
+          "snake: rapid opposite presses never self-reverse into a self-kill")
+
+    # 4d. deque(maxlen=2) eviction must never leave a 180° reversal that step()
+    # applies (QA regression): moving down with a legal turn already queued, two
+    # perpendicular taps in one tick must NOT fold the snake back upward.
+    g = SnakeGame(20, 20, seed=46)
+    g.state = "playing"
+    g.snake = deque([(15, 10), (15, 9), (15, 8)])
+    g.cells = set(g.snake)
+    g.direction = (0, 1)            # moving down
+    g.queue.clear()
+    g.queue.append((1, 0))          # a legal RIGHT already queued
+    g.set_dir("up")
+    g.set_dir("left")
+    g.step()
+    check(g.state == "playing" and g.direction != (0, -1),
+          "snake: queue eviction never applies a 180-degree reverse of heading")
+
+    # 5. New food never lands on a snake cell over many eats.
+    g = SnakeGame(15, 15, seed=12345)
+    g.state = "playing"
+    ok_food = True
+    eats = 0
+    guard = 0
+    while eats < 10 and guard < 5000:
+        guard += 1
+        # Steer toward food along x then y, avoiding reversal.
+        hx, hy = g.snake[0]
+        if g.food is None:
+            break
+        fx, fy = g.food
+        if fx != hx:
+            g.set_dir("right" if fx > hx else "left")
+        elif fy != hy:
+            g.set_dir("down" if fy > hy else "up")
+        prev_score = g.score
+        g.step()
+        if g.state == "gameover":
+            # Reset and continue trying (still validates food placement).
+            g.state = "playing"
+        if g.food is not None and g.food in g.cells:
+            ok_food = False
+            break
+        if g.score > prev_score:
+            eats += 1
+    check(ok_food and eats >= 10,
+          "snake: new food never lands on a snake cell over many eats")
+
+    # 6. Interval strictly decreases as score increases, but never below MIN_INT.
+    g = SnakeGame(20, 20, seed=6)
+    intervals = []
+    for s in range(0, 60):
+        g.score = s
+        intervals.append(g.interval())
+    strictly_dec = all(
+        intervals[i] > intervals[i + 1] or
+        (intervals[i] == intervals[i + 1] == SNAKE_MIN_INT)
+        for i in range(len(intervals) - 1)
+    )
+    check(strictly_dec, "snake: tick interval decreases with score (until MIN_INT)")
+    check(min(intervals) >= SNAKE_MIN_INT - 1e-12, "snake: interval never below MIN_INT")
+
+    # 7. High score round-trips.
+    save_high("snake", 57)
+    check(load_high("snake") == 57, "snake: high score round-trips")
+
+
+# =========================================================================== #
+# GAME: pong — you (left paddle) vs CPU (right); rally as long as you can
+# =========================================================================== #
+PONG_FPS = 30
+PONG_MIN_W, PONG_MIN_H = 34, 14
+PONG_PADDLE_H = 4            # paddle height (rows)
+PONG_PADDLE_SPEED = 1.3     # rows/frame while a move key is held
+PONG_PADDLE_HOLD = 0.14     # seconds a single key-press keeps the paddle moving
+PONG_BALL_VX = 0.55         # initial horizontal ball speed (cols/frame)
+PONG_BALL_VY = 0.35         # initial vertical ball speed (rows/frame)
+PONG_BALL_SPEEDUP = 1.05    # |vx| grows on each player hit (ramps difficulty)
+PONG_BALL_MAX = 1.25        # speed cap so the ball never tunnels a paddle/wall
+PONG_CPU_SPEED = 0.95       # CPU paddle max rows/frame (returns most; beatable)
+PONG_LIVES = 3              # misses you can afford before game over
+
+
+class PongGame:
+    """Pong vs CPU — pure logic, no curses. You are the LEFT paddle; the CPU
+    returns from the right. Your SCORE is how many times you hit the ball (rally
+    length); you lose a life each time the ball gets past you, game over at 0
+    lives. The ball speeds up on every hit you make, so the rally eventually
+    beats you — the score is bounded and a high score means a long rally."""
+
+    def __init__(self, w, h, seed=None):
+        self.rng = random.Random(seed)
+        self.set_size(w, h)
+        self.reset()
+
+    def set_size(self, w, h):
+        self.w = max(PONG_MIN_W, w)
+        self.h = max(PONG_MIN_H, h)
+        self.top = 1                       # first playable row (row 0 = HUD)
+        self.bottom = self.h - 2           # last playable row
+        self.px_col = 2                    # player paddle column
+        self.cpu_col = self.w - 3          # CPU paddle column
+        if hasattr(self, "py"):
+            self.py = self._clamp(self.py)
+            self.cy = self._clamp(self.cy)
+
+    def _clamp(self, y):
+        lo = float(self.top)
+        hi = float(self.bottom - (PONG_PADDLE_H - 1))
+        return max(lo, min(hi, y))
+
+    def reset(self):
+        self.state = "title"
+        self.score = 0                     # rally hits (your score)
+        self.lives = PONG_LIVES
+        self.high = load_high("pong")
+        self.gameover_at = 0.0
+        self.p_vy = 0.0
+        self.p_intent_until = 0.0
+        mid = (self.top + self.bottom) / 2.0 - (PONG_PADDLE_H - 1) / 2.0
+        self.py = self._clamp(mid)
+        self.cy = self._clamp(mid)
+        self._serve(toward_player=False)
+
+    def _serve(self, toward_player):
+        self.bx = self.w / 2.0
+        self.by = (self.top + self.bottom) / 2.0
+        self.bvx = -PONG_BALL_VX if toward_player else PONG_BALL_VX
+        self.bvy = self.rng.choice((-1.0, 1.0)) * PONG_BALL_VY
+
+    # -- input (pure) ----------------------------------------------------- #
+    def move_up(self, now):
+        if self.state == "playing":
+            self.p_vy = -PONG_PADDLE_SPEED
+            self.p_intent_until = now + PONG_PADDLE_HOLD
+
+    def move_down(self, now):
+        if self.state == "playing":
+            self.p_vy = PONG_PADDLE_SPEED
+            self.p_intent_until = now + PONG_PADDLE_HOLD
+
+    def start_or_restart(self, now):
+        if self.state in ("title", "gameover"):
+            if self.state == "gameover" and now - self.gameover_at < RESTART_LOCK:
+                return
+            keep = self.high
+            self.reset()
+            self.high = keep
+            self.state = "playing"
+
+    def toggle_pause(self):
+        if self.state == "playing":
+            self.state = "paused"
+        elif self.state == "paused":
+            self.state = "playing"
+
+    # -- per-frame update ------------------------------------------------- #
+    def update(self, now):
+        if self.state != "playing":
+            return
+
+        # Player paddle: keep moving only while the key-press is still fresh.
+        if now > self.p_intent_until:
+            self.p_vy = 0.0
+        self.py = self._clamp(self.py + self.p_vy)
+
+        # CPU paddle: chase the ball's row at a capped speed (so it's beatable).
+        target = self.by - (PONG_PADDLE_H - 1) / 2.0
+        if target < self.cy:
+            self.cy = max(target, self.cy - PONG_CPU_SPEED)
+        elif target > self.cy:
+            self.cy = min(target, self.cy + PONG_CPU_SPEED)
+        self.cy = self._clamp(self.cy)
+
+        # Move the ball.
+        self.bx += self.bvx
+        self.by += self.bvy
+
+        # Top / bottom walls.
+        if self.by <= self.top:
+            self.by = float(self.top)
+            self.bvy = abs(self.bvy)
+        elif self.by >= self.bottom:
+            self.by = float(self.bottom)
+            self.bvy = -abs(self.bvy)
+
+        # Player paddle (left) — reflect if it covers the ball's row.
+        if self.bvx < 0 and self.bx <= self.px_col:
+            if self.py <= self.by <= self.py + (PONG_PADDLE_H - 1):
+                self.bx = float(self.px_col)
+                self._bounce(self.py, to_right=True)
+                self.score += 1
+                if self.score > self.high:
+                    self.high = self.score
+                    save_high("pong", self.high)
+        # Player miss -> lose a life, re-serve (or game over).
+        if self.bx < 0:
+            self.lives -= 1
+            if self.lives <= 0:
+                self._gameover()
+            else:
+                self._serve(toward_player=True)
+            return
+
+        # CPU paddle (right) — reflect if it covers the ball's row.
+        if self.bvx > 0 and self.bx >= self.cpu_col:
+            if self.cy <= self.by <= self.cy + (PONG_PADDLE_H - 1):
+                self.bx = float(self.cpu_col)
+                self._bounce(self.cy, to_right=False)
+        # CPU miss -> the rally just continues (re-serve toward the CPU).
+        if self.bx > self.w - 1:
+            self._serve(toward_player=False)
+            return
+
+    def _bounce(self, paddle_top, to_right):
+        mag = min(PONG_BALL_MAX, abs(self.bvx) * PONG_BALL_SPEEDUP)
+        self.bvx = mag if to_right else -mag
+        # "English": where the ball met the paddle sets the new vertical angle.
+        center = paddle_top + (PONG_PADDLE_H - 1) / 2.0
+        off = (self.by - center) / (PONG_PADDLE_H / 2.0)
+        off = max(-1.0, min(1.0, off))
+        self.bvy = off * (PONG_BALL_MAX * 0.7)
+        if abs(self.bvy) < 0.12:
+            self.bvy = 0.18 if self.bvy >= 0 else -0.18
+
+    def _gameover(self):
+        self.state = "gameover"
+        self.gameover_at = time.monotonic()
+        if self.score > self.high:
+            self.high = self.score
+            save_high("pong", self.high)
+
+
+def run_pong(stdscr):
+    import curses
+
+    ui = CursesUI(stdscr)
+    setup_input(stdscr, curses)
+    ui.resize()
+    game = PongGame(ui.W, ui.H)
+
+    def draw():
+        stdscr.erase()
+        ui.resize()
+        if ui.too_small(PONG_MIN_W, PONG_MIN_H):
+            ui.draw_too_small(PONG_MIN_W, PONG_MIN_H)
+            stdscr.refresh()
+            return
+        W, H = ui.W, ui.H
+
+        # Centre net.
+        for yy in range(game.top, game.bottom + 1):
+            if yy % 2 == 0:
+                ui.put(yy, W // 2, "│", ui.color("white", curses.A_DIM))
+
+        # Paddles + ball.
+        ptop = int(round(game.py))
+        ctop = int(round(game.cy))
+        for i in range(PONG_PADDLE_H):
+            ui.put(ptop + i, game.px_col, "█", ui.color("green", curses.A_BOLD))
+            ui.put(ctop + i, game.cpu_col, "█", ui.color("magenta", curses.A_BOLD))
+        ui.put(int(round(game.by)), int(round(game.bx)), "●",
+               ui.color("yellow", curses.A_BOLD))
+
+        # HUD.
+        ui.put(0, 1, "pong", ui.color("cyan"))
+        hud = f"RALLY {game.score:03d}   LIVES {game.lives}   HI {game.high:03d}"
+        ui.put(0, max(0, W - len(hud) - 1), hud, ui.color("cyan", curses.A_BOLD))
+
+        if game.state == "title":
+            cy = H // 2 - 2
+            ui.center(cy, "P O N G", ui.color("green", curses.A_BOLD))
+            ui.center(cy + 2, "↑/↓ or w/s  move  (you are the left paddle)")
+            ui.center(cy + 3, "p pause     q quit")
+            ui.center(cy + 5, "press SPACE to serve", ui.color("cyan", curses.A_BOLD))
+        elif game.state == "paused":
+            ui.center(H // 2, "  P A U S E D  ",
+                      ui.color("cyan", curses.A_BOLD | curses.A_REVERSE))
+        elif game.state == "gameover":
+            cy = H // 2 - 2
+            ui.center(cy, "  G A M E   O V E R  ",
+                      ui.color("red", curses.A_BOLD | curses.A_REVERSE))
+            ui.center(cy + 2, f"rally {game.score:03d}    best {game.high:03d}",
+                      ui.color("cyan"))
+            if game.score >= game.high and game.score > 0:
+                ui.center(cy + 3, "★ new best! ★", ui.color("yellow", curses.A_BOLD))
+            ui.center(cy + 5, "SPACE restart   ·   q quit")
+
+        stdscr.refresh()
+
+    frame_dt = 1.0 / PONG_FPS
+    next_t = time.perf_counter()
+    running = True
+    try:
+        while running:
+            now = time.monotonic()
+            h, w = stdscr.getmaxyx()
+            if (h, w) != (game.h, game.w) and game.state in ("title", "gameover"):
+                game.set_size(w, h)
+                game.reset()
+
+            while True:
+                c = stdscr.getch()
+                if c == -1:
+                    break
+                if c in (ord("q"), ord("Q")):
+                    running = False
+                elif c == ord(" "):
+                    if game.state in ("title", "gameover"):
+                        game.start_or_restart(now)
+                elif c in (curses.KEY_UP, ord("w"), ord("k")):
+                    if game.state in ("title", "gameover"):
+                        game.start_or_restart(now)
+                    else:
+                        game.move_up(now)
+                elif c in (curses.KEY_DOWN, ord("s"), ord("j")):
+                    if game.state in ("title", "gameover"):
+                        game.start_or_restart(now)
+                    else:
+                        game.move_down(now)
+                elif c in (ord("p"), ord("P")):
+                    game.toggle_pause()
+
+            game.update(now)
+            draw()
+
+            next_t += frame_dt
+            slack = next_t - time.perf_counter()
+            if slack > 0:
+                time.sleep(slack)
+            else:
+                next_t = time.perf_counter()
+    except KeyboardInterrupt:
+        pass
+
+
+def selftest_pong(check):
+    # Walls: ball reflects vertically off top and bottom.
+    g = PongGame(40, 20, seed=1)
+    g.state = "playing"
+    g.bx = g.w / 2.0
+    g.by = float(g.top)
+    g.bvx = 0.5
+    g.bvy = -0.3
+    g.update(0.0)
+    check(g.bvy > 0, "pong: ball bounces off the top wall")
+    g.by = float(g.bottom)
+    g.bvy = 0.3
+    g.update(0.0)
+    check(g.bvy < 0, "pong: ball bounces off the bottom wall")
+
+    # Player paddle hit reflects the ball right and scores a rally point.
+    g = PongGame(40, 20, seed=2)
+    g.state = "playing"
+    g.py = 8.0
+    g.by = 9.0
+    g.bx = float(g.px_col) + 0.2
+    g.bvx = -0.5
+    s0 = g.score
+    g.update(0.0)
+    check(g.bvx > 0 and g.score == s0 + 1,
+          "pong: a paddle hit reflects the ball and adds a rally point")
+
+    # A miss costs a life and re-serves; missing on the last life ends the game.
+    g = PongGame(40, 20, seed=3)
+    g.state = "playing"
+    g.lives = 3
+    g.py = 2.0
+    g.by = float(g.bottom)        # ball far from the (top) paddle -> miss
+    g.bx = 0.4
+    g.bvx = -0.6
+    g.update(0.0)
+    check(g.lives == 2 and g.state == "playing",
+          "pong: a miss costs a life and re-serves")
+    g.lives = 1
+    g.py = 2.0
+    g.by = float(g.bottom)
+    g.bx = 0.4
+    g.bvx = -0.6
+    g.update(0.0)
+    check(g.state == "gameover", "pong: missing on the last life ends the game")
+
+    # Player paddle moves and clamps within bounds.
+    g = PongGame(40, 20, seed=5)
+    g.state = "playing"
+    g.move_up(0.0)
+    for _ in range(60):
+        g.update(0.05)            # now < intent_until -> keeps moving up
+    check(g.py == float(g.top), "pong: paddle moves up and clamps at the top")
+    g.move_down(0.0)
+    for _ in range(60):
+        g.update(0.05)
+    check(g.py == float(g.bottom - (PONG_PADDLE_H - 1)),
+          "pong: paddle moves down and clamps at the bottom")
+    g.move_up(0.0)
+    g.update(5.0)                 # now >> intent_until -> paddle stops
+    y1 = g.py
+    g.update(6.0)
+    check(g.py == y1, "pong: paddle stops after the key-hold window expires")
+
+    # CPU paddle tracks the ball.
+    g = PongGame(40, 20, seed=6)
+    g.state = "playing"
+    g.cy = 2.0
+    g.by = float(g.bottom)
+    c0 = g.cy
+    g.update(0.0)
+    check(g.cy > c0, "pong: CPU paddle moves toward the ball")
+
+    # Determinism: same seed -> identical evolution.
+    a = PongGame(50, 22, seed=9)
+    b = PongGame(50, 22, seed=9)
+    a.state = b.state = "playing"
+    for _ in range(300):
+        a.update(0.0)
+        b.update(0.0)
+    check((a.bx, a.by, a.score, a.lives) == (b.bx, b.by, b.score, b.lives),
+          "pong: deterministic with a fixed seed")
+
+    # High score round-trips.
+    save_high("pong", 7)
+    check(load_high("pong") == 7, "pong: high score round-trips")
+
+
+# =========================================================================== #
+# GAME: flappy — flappy bird (dino-style physics)
+# =========================================================================== #
+FLAPPY_FPS = 30
+# Feel tuning (was twitchy + "genuinely hard"). Lower, gentler gravity and a
+# smaller flap impulse turn each flap into a controllable ~4-row hop (smaller
+# than the gap) instead of a violent ~6-row launch; the apex comes sooner so
+# fine altitude corrections are easy. Gaps are wider and pipes further apart so
+# there's always comfortable reaction time. Proven winnable by the autopilot.
+FLAPPY_GRAVITY = 0.09        # was 0.10
+FLAPPY_FLAP_V = 0.85         # was 1.1  (rise ≈ 0.85^2/(2*0.09) ≈ 4.0 rows)
+FLAPPY_MAX_FALL = 0.95       # NEW: clamp terminal fall so a dive stays catchable
+FLAPPY_BASE_SPEED = 0.42     # was 0.45 (a touch slower start = more reaction time)
+FLAPPY_MAX_SPEED = 1.05      # was 1.2
+FLAPPY_SPEED_RAMP = 0.00015  # was 0.0002 (ramps slower)
+FLAPPY_GAP = 7               # was 6
+FLAPPY_GAP_FLOOR = 5         # was 4
+FLAPPY_PIPE_W = 3
+FLAPPY_PIPE_SPACING = 26     # was 22 (more horizontal room between pipes)
+BIRD_X = 6
+FLAPPY_MIN_W, FLAPPY_MIN_H = 36, 14
+
+FLAPPY_BIRD = ["▄█▄", "▀█▀"]
+FLAPPY_BIRD_H = len(FLAPPY_BIRD)
+
+
+def _flappy_hitbox_cells(top):
+    """Forgiving bird hitbox: the bird sprite's solid cells MINUS its four
+    corners, so a near-miss that only clips a wing-tip corner isn't a death.
+    Keeps collisions fair/controllable without letting the bird phase through
+    a pipe wall."""
+    sp = FLAPPY_BIRD
+    h = len(sp)
+    cells = set()
+    for r, row in enumerate(sp):
+        w = len(row)
+        for c, ch in enumerate(row):
+            if ch == " ":
+                continue
+            is_corner = (r in (0, h - 1)) and (c in (0, w - 1))
+            if is_corner:
+                continue
+            cells.add((top + r, BIRD_X + c))
+    return cells
+
+
+class FlappyGame:
+    """Flappy logic — pure, no curses. Bird fixed at BIRD_X, pipes scroll left."""
+
+    def __init__(self, w, h, seed=None):
+        self.rng = random.Random(seed)
+        self.set_size(w, h)
+        self.reset()
+
+    def set_size(self, w, h):
+        self.w = max(FLAPPY_MIN_W, w)
+        self.h = max(FLAPPY_MIN_H, h)
+        self.ground = self.h - 2
+
+    def reset(self):
+        self.state = "title"
+        self.y = float(self.h // 2)
+        self.vy = 0.0
+        self.pipes = []  # {x, gap_top, gap_h, scored}
+        self.score = 0
+        self.high = load_high("flappy")
+        self.speed = FLAPPY_BASE_SPEED
+        self.distance = 0.0
+        self._spawn_pipe(float(self.w + 2))
+
+    def gap_h(self):
+        return max(FLAPPY_GAP_FLOOR, FLAPPY_GAP - self.score // 5)
+
+    def _spawn_pipe(self, x):
+        gh = self.gap_h()
+        top_min = 1
+        top_max = max(top_min + 1, self.ground - gh - 1)
+        gap_top = self.rng.randint(top_min, top_max)
+        self.pipes.append({"x": float(x), "gap_top": gap_top, "gap_h": gh,
+                           "scored": False})
+
+    def start_or_restart(self):
+        if self.state in ("title", "gameover"):
+            keep_high = self.high
+            self.reset()
+            self.high = keep_high
+            self.state = "playing"
+
+    def toggle_pause(self):
+        if self.state == "playing":
+            self.state = "paused"
+        elif self.state == "paused":
+            self.state = "playing"
+
+    def flap(self):
+        if self.state == "playing":
+            self.vy = -FLAPPY_FLAP_V
+
+    def bird_top(self):
+        return int(round(self.y))
+
+    def bird_cells(self):
+        # Forgiving hitbox (corners ignored) used for pipe collision.
+        return _flappy_hitbox_cells(self.bird_top())
+
+    def update(self, now=None):
+        if self.state != "playing":
+            return
+
+        self.speed = min(FLAPPY_MAX_SPEED, FLAPPY_BASE_SPEED + self.distance * FLAPPY_SPEED_RAMP)
+        self.distance += self.speed
+
+        self.vy += FLAPPY_GRAVITY
+        if self.vy > FLAPPY_MAX_FALL:
+            self.vy = FLAPPY_MAX_FALL
+        self.y += self.vy
+
+        for p in self.pipes:
+            p["x"] -= self.speed
+
+        # Spawn new pipes based on spacing from the rightmost pipe.
+        if self.pipes:
+            rightmost = max(p["x"] for p in self.pipes)
+        else:
+            rightmost = -1e9
+        if (self.w - rightmost) >= FLAPPY_PIPE_SPACING:
+            self._spawn_pipe(float(self.w + 1))
+
+        # Score: a pipe's right edge passing BIRD_X.
+        for p in self.pipes:
+            if not p["scored"] and (p["x"] + FLAPPY_PIPE_W) < BIRD_X:
+                p["scored"] = True
+                self.score += 1
+
+        # Cull off-screen pipes.
+        self.pipes = [p for p in self.pipes if p["x"] + FLAPPY_PIPE_W >= 0]
+
+        # Ceiling / ground.
+        if self.y < 0:
+            self._die()
+            return
+        if self.y + (FLAPPY_BIRD_H - 1) >= self.ground:
+            self._die()
+            return
+
+        # Pipe collision (per-cell within the pipe columns).
+        bird = self.bird_cells()
+        for p in self.pipes:
+            px = int(round(p["x"]))
+            cols = range(px, px + FLAPPY_PIPE_W)
+            # Only check if bird columns overlap pipe columns.
+            if px > BIRD_X + 3 or px + FLAPPY_PIPE_W < BIRD_X:
+                continue
+            gt = p["gap_top"]
+            gb = p["gap_top"] + p["gap_h"]
+            for (cy, cx) in bird:
+                if cx in cols and (cy < gt or cy >= gb):
+                    self._die()
+                    return
+
+    def _die(self):
+        self.state = "gameover"
+        if self.score > self.high:
+            self.high = self.score
+            save_high("flappy", self.high)
+
+
+def run_flappy(stdscr):
+    import curses
+
+    ui = CursesUI(stdscr)
+    setup_input(stdscr, curses)
+
+    ui.resize()
+    game = FlappyGame(ui.W, ui.H)
+
+    def draw():
+        stdscr.erase()
+        ui.resize()
+        if ui.too_small(FLAPPY_MIN_W, FLAPPY_MIN_H):
+            ui.draw_too_small(FLAPPY_MIN_W, FLAPPY_MIN_H)
+            stdscr.refresh()
+            return
+
+        W, H = ui.W, ui.H
+        ground = game.ground
+
+        # Ground line.
+        ui.put(ground, 0, "─" * (W - 1), ui.color("white", curses.A_DIM))
+
+        # Pipes.
+        for p in game.pipes:
+            px = int(round(p["x"]))
+            gt = p["gap_top"]
+            gb = p["gap_top"] + p["gap_h"]
+            for yy in range(0, ground):
+                if yy < gt or yy >= gb:
+                    for dx in range(FLAPPY_PIPE_W):
+                        ui.put(yy, px + dx, "█", ui.color("green"))
+
+        # Bird.
+        bird_attr = (ui.color("yellow", curses.A_BOLD)
+                     if game.state != "gameover" else ui.color("red", curses.A_BOLD))
+        ui.blit(FLAPPY_BIRD, game.bird_top(), BIRD_X, bird_attr)
+
+        # HUD.
+        hud = f"HI {game.high:04d}   {game.score:04d}"
+        ui.put(0, max(0, W - len(hud) - 1), hud, ui.color("cyan", curses.A_BOLD))
+        ui.put(0, 1, "flappy", ui.color("yellow"))
+
+        if game.state == "title":
+            cy = H // 2 - 2
+            ui.center(cy, "F L A P P Y", ui.color("yellow", curses.A_BOLD))
+            ui.center(cy + 2, "SPACE / ↑  flap")
+            ui.center(cy + 3, "p pause     q quit")
+            ui.center(cy + 5, "press SPACE to fly", ui.color("cyan", curses.A_BOLD))
+        elif game.state == "paused":
+            ui.center(H // 2, "  P A U S E D  ",
+                      ui.color("cyan", curses.A_BOLD | curses.A_REVERSE))
+        elif game.state == "gameover":
+            cy = H // 2 - 2
+            ui.center(cy, "  G A M E   O V E R  ",
+                      ui.color("red", curses.A_BOLD | curses.A_REVERSE))
+            ui.center(cy + 2, f"score {game.score:04d}    best {game.high:04d}",
+                      ui.color("cyan"))
+            if game.score >= game.high and game.score > 0:
+                ui.center(cy + 3, "★ new best! ★", ui.color("yellow", curses.A_BOLD))
+            ui.center(cy + 5, "SPACE restart   ·   q quit")
+
+        stdscr.refresh()
+
+    frame_dt = 1.0 / FLAPPY_FPS
+    next_t = time.perf_counter()
+    running = True
+    try:
+        while running:
+            now = time.monotonic()
+            h, w = stdscr.getmaxyx()
+            if (h, w) != (game.h, game.w) and game.state in ("title", "gameover"):
+                game.set_size(w, h)
+                game.reset()
+
+            while True:
+                c = stdscr.getch()
+                if c == -1:
+                    break
+                if c in (ord("q"), ord("Q")):
+                    running = False
+                elif c in (ord(" "), curses.KEY_UP, ord("w"), ord("k")):
+                    if game.state in ("title", "gameover"):
+                        game.start_or_restart()
+                    else:
+                        game.flap()
+                elif c in (ord("p"), ord("P")):
+                    game.toggle_pause()
+
+            game.update(now)
+            draw()
+
+            next_t += frame_dt
+            slack = next_t - time.perf_counter()
+            if slack > 0:
+                time.sleep(slack)
+            else:
+                next_t = time.perf_counter()
+    except KeyboardInterrupt:
+        pass
+
+
+def selftest_flappy(check):
+    # 1. With no flapping, the bird falls and the game eventually ends.
+    g = FlappyGame(80, 24, seed=1)
+    g.state = "playing"
+    ended = False
+    for _ in range(2000):
+        g.update()
+        if g.state == "gameover":
+            ended = True
+            break
+    check(ended, "flappy: no-flap bird falls and the game ends")
+
+    # 2. A well-timed flap when a pipe gap is aligned lets the bird pass + score+1.
+    #    Suppress further spawns so exactly one pipe is in play; hold altitude by
+    #    flapping only when sinking toward the bottom of the gap.
+    g = FlappyGame(80, 24, seed=2)
+    g.state = "playing"
+    g._spawn_pipe = lambda x: None
+    gap_top, gap_h = 4, 14  # wide, clearable gap aligned to the bird
+    g.pipes = [{"x": float(BIRD_X + 18), "gap_top": gap_top, "gap_h": gap_h,
+                "scored": False}]
+    g.y = float(gap_top + 2)
+    g.vy = 0.0
+    low = gap_top + gap_h - 4
+    score_before = g.score
+    passed = False
+    for _ in range(400):
+        if g.vy > 0 and g.y >= low:
+            g.flap()
+        g.update()
+        if g.state == "gameover":
+            break
+        if g.score > score_before:
+            passed = True
+            break
+    check(passed and g.state != "gameover",
+          "flappy: aligned well-timed flap passes the pipe and scores +1")
+
+    # 3. Flying into a pipe body (misaligned, never flap) ends the game.
+    g = FlappyGame(80, 24, seed=3)
+    g.state = "playing"
+    g.pipes = [{"x": float(BIRD_X + 2), "gap_top": 1, "gap_h": 4, "scored": False}]
+    g.y = 14.0  # well below the gap -> into the pipe body
+    g.vy = 0.0
+    died = False
+    for _ in range(60):
+        g.update()
+        if g.state == "gameover":
+            died = True
+            break
+    check(died, "flappy: flying into a pipe body ends the game")
+
+    # 4a. Hitting the ceiling (spam flaps) ends the game.
+    g = FlappyGame(80, 24, seed=4)
+    g.state = "playing"
+    g.pipes = []  # clear pipes to isolate ceiling
+    g.y = 2.0
+    ceiling_death = False
+    for _ in range(200):
+        g.flap()
+        g.update()
+        if g.state == "gameover":
+            ceiling_death = True
+            break
+    check(ceiling_death, "flappy: hitting the ceiling ends the game")
+
+    # 4b. Hitting the ground (no flap) ends the game.
+    g = FlappyGame(80, 24, seed=5)
+    g.state = "playing"
+    g.pipes = []
+    g.y = float(g.ground - 3)
+    ground_death = False
+    for _ in range(200):
+        g.update()
+        if g.state == "gameover":
+            ground_death = True
+            break
+    check(ground_death, "flappy: hitting the ground ends the game")
+
+    # 5. Each pipe is scored exactly once.
+    #    Single wide-gap pipe, spawns suppressed, bird held aloft; it scores once.
+    g = FlappyGame(80, 24, seed=6)
+    g.state = "playing"
+    g._spawn_pipe = lambda x: None
+    gap_top, gap_h = 4, 14
+    g.pipes = [{"x": float(BIRD_X + 15), "gap_top": gap_top, "gap_h": gap_h,
+                "scored": False}]
+    g.y = float(gap_top + 2)
+    g.vy = 0.0
+    low = gap_top + gap_h - 4
+    counts = 0
+    for _ in range(400):
+        if g.vy > 0 and g.y >= low:
+            g.flap()
+        before = g.score
+        g.update()
+        counts += max(0, g.score - before)
+        if g.state == "gameover":
+            break
+        if not g.pipes:
+            break
+    check(counts == 1, "flappy: a passed pipe scores exactly once")
+    # Verify the scored flag prevents a double count for one constructed pipe
+    # that is already left of the bird (right edge < BIRD_X after one step).
+    g2 = FlappyGame(80, 24, seed=7)
+    g2.state = "playing"
+    g2._spawn_pipe = lambda x: None
+    g2.pipes = [{"x": 2.0, "gap_top": 1, "gap_h": 20, "scored": False}]
+    g2.y = 10.0
+    g2.vy = 0.0
+    s0 = g2.score
+    g2.update()
+    after_first = g2.score
+    g2.update()
+    after_second = g2.score
+    check(after_first == s0 + 1 and after_second == after_first,
+          "flappy: scored flag prevents double-counting a pipe")
+
+    # 6. Speed ramps up and stays <= MAX_SPEED; gap never below floor.
+    g = FlappyGame(80, 24, seed=8)
+    g.state = "playing"
+    speed_seen = []
+    gaps_ok = True
+    for _ in range(1500):
+        g.update()
+        speed_seen.append(g.speed)
+        for p in g.pipes:
+            if p["gap_h"] < FLAPPY_GAP_FLOOR:
+                gaps_ok = False
+        if g.state == "gameover":
+            # restart to keep ramping distance growing
+            g.state = "playing"
+            g.y = float(g.h // 2)
+            g.vy = 0.0
+            g.pipes = []
+    check(max(speed_seen) > FLAPPY_BASE_SPEED, "flappy: speed ramps up over distance")
+    check(max(speed_seen) <= FLAPPY_MAX_SPEED + 1e-9, "flappy: speed stays capped")
+    check(gaps_ok, "flappy: pipe gap never shrinks below its floor")
+
+    # 7. High score round-trips.
+    save_high("flappy", 42)
+    check(load_high("flappy") == 42, "flappy: high score round-trips")
+
+
+# =========================================================================== #
+# Registry
+# =========================================================================== #
+GAMES = {
+    "dino":   {"title": "Dino — T-Rex Runner", "run": run_dino,   "selftest": selftest_dino},
+    "snake":  {"title": "Snake",               "run": run_snake,  "selftest": selftest_snake},
+    "pong":   {"title": "Pong",                "run": run_pong,   "selftest": selftest_pong},
+    "flappy": {"title": "Flappy",              "run": run_flappy, "selftest": selftest_flappy},
+}
+DEFAULT_GAME = "dino"
+GAME_ORDER = ["dino", "snake", "pong", "flappy"]
+MENU_CHOICE = "menu"            # special "configured game": open the game selector
+DEFAULT_CHOICE = MENU_CHOICE    # what the auto-open pops by default
+
+
+def is_valid_game(gid):
+    return gid in GAMES
+
+
+def is_valid_choice(gid):
+    # A configured pop-up choice may be any game OR the menu selector.
+    return gid in GAMES or gid == MENU_CHOICE
+
+
+def _valid_ids_str():
+    return ", ".join(GAME_ORDER)
+
+
+# =========================================================================== #
+# Config I/O
+# =========================================================================== #
+VALID_MODES = ("every-prompt", "session")
+
+
+def load_config():
+    data = _read_json(config_path(), {})
+    if not isinstance(data, dict):
+        data = {}
+    game = data.get("game", DEFAULT_CHOICE)
+    if not is_valid_choice(game):
+        game = DEFAULT_CHOICE
+    mode = data.get("mode", "every-prompt")
+    if mode not in VALID_MODES:
+        mode = "every-prompt"
+    return {"game": game, "mode": mode}
+
+
+def save_config(cfg):
+    game = cfg.get("game", DEFAULT_CHOICE)
+    if not is_valid_choice(game):
+        game = DEFAULT_CHOICE
+    mode = cfg.get("mode", "every-prompt")
+    if mode not in VALID_MODES:
+        mode = "every-prompt"
+    _atomic_write_json(config_path(), {"game": game, "mode": mode})
+    return {"game": game, "mode": mode}
+
+
+# =========================================================================== #
+# Claude settings editing — enable / disable
+# =========================================================================== #
+def _command_is_managed(cmd):
+    # Match ONLY tokenop's own hook commands ("<path>/tokenop open|close" or the
+    # bare form) and the legacy dino-claude-hook tool. Deliberately NOT a loose
+    # substring test, so a user's unrelated hook that merely contains the text
+    # "tokenop open" is never silently removed.
+    if not isinstance(cmd, str):
+        return False
+    c = cmd.strip()
+    if "dino-claude-hook" in c:                      # legacy mechanism
+        return True
+    # current "tokenop" hooks + legacy "arcade" hooks (so enable migrates cleanly)
+    for _name in ("tokenop", "arcade"):
+        if (c.endswith("/" + _name + " open") or c.endswith("/" + _name + " close")
+                or c in (_name + " open", _name + " close")):
+            return True
+    return False
+
+
+def _strip_managed_hooks(settings):
+    """Remove tokenop + legacy dino hook groups from every event list."""
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return settings
+    new_hooks = {}
+    for event, groups in hooks.items():
+        if not isinstance(groups, list):
+            new_hooks[event] = groups
+            continue
+        new_groups = []
+        for group in groups:
+            if not isinstance(group, dict) or "hooks" not in group:
+                new_groups.append(group)
+                continue
+            inner = group.get("hooks", [])
+            if not isinstance(inner, list):
+                new_groups.append(group)
+                continue
+            kept = [h for h in inner
+                    if not (isinstance(h, dict) and _command_is_managed(h.get("command")))]
+            if kept:
+                ng = dict(group)
+                ng["hooks"] = kept
+                new_groups.append(ng)
+            # else: drop the now-empty group
+        if new_groups:
+            new_hooks[event] = new_groups
+        # else: drop the now-empty event list
+    settings["hooks"] = new_hooks
+    return settings
+
+
+def _arcade_hook_group(action):
+    return {"hooks": [{"type": "command",
+                       "command": f"{TOKENOP_BIN} {action}",
+                       "async": True}]}
+
+
+def apply_enable(mode="every-prompt"):
+    """Core enable: edit settings, return (ok, short_msg). No printing — safe to
+    call from the curses menu (where stdout would corrupt the screen)."""
+    if mode not in VALID_MODES:
+        return False, f"invalid mode '{mode}'"
+    path = claude_settings_path()
+    if path.exists():
+        try:
+            with open(path) as f:
+                settings = json.load(f)
+            if not isinstance(settings, dict):
+                raise ValueError("settings root is not an object")
+        except Exception as e:
+            return False, f"corrupt settings file ({e})"
+    else:
+        settings = {}
+
+    had_hooks_key = "hooks" in settings
+    _strip_managed_hooks(settings)
+    if "hooks" not in settings or not isinstance(settings.get("hooks"), dict):
+        settings["hooks"] = {}
+    hooks = settings["hooks"]
+    hooks.setdefault("UserPromptSubmit", [])
+    hooks["UserPromptSubmit"].append(_arcade_hook_group("open"))
+    if mode == "every-prompt":
+        hooks.setdefault("Stop", [])
+        hooks["Stop"].append(_arcade_hook_group("close"))
+    if not had_hooks_key and not settings["hooks"]:
+        del settings["hooks"]
+    _atomic_write_json(path, settings)
+
+    cfg = load_config()
+    cfg["mode"] = mode
+    save_config(cfg)
+    return True, f"auto-open ON ({mode})"
+
+
+def apply_disable():
+    """Core disable: strip tokenop + legacy hooks, return (ok, short_msg). No printing."""
+    path = claude_settings_path()
+    if not path.exists():
+        return True, "already off"
+    try:
+        with open(path) as f:
+            settings = json.load(f)
+        if not isinstance(settings, dict):
+            raise ValueError("settings root is not an object")
+    except Exception as e:
+        return False, f"corrupt settings file ({e})"
+    _strip_managed_hooks(settings)
+    _atomic_write_json(path, settings)
+    return True, "auto-open OFF"
+
+
+def cmd_enable(mode="every-prompt"):
+    if mode not in VALID_MODES:
+        sys.stderr.write(f"tokenop: invalid mode '{mode}' (choose: {', '.join(VALID_MODES)})\n")
+        return 2
+    ok, msg = apply_enable(mode)
+    if not ok:
+        sys.stderr.write(f"tokenop: refusing to edit settings: {msg}\n")
+        return 1
+    cfg = load_config()
+    if mode == "every-prompt":
+        print("tokenop enabled (mode: every-prompt) — opens on prompt, closes on stop.")
+    else:
+        print("tokenop enabled (mode: session) — opens on prompt; window stays open.")
+    print(f"  settings: {claude_settings_path()}")
+    print(f"  game:     {cfg['game']}")
+    return 0
+
+
+def cmd_disable():
+    ok, msg = apply_disable()
+    if not ok:
+        sys.stderr.write(f"tokenop: refusing to edit settings: {msg}\n")
+        return 1
+    if msg == "already off":
+        print("tokenop already disabled (no settings file).")
+    else:
+        print("tokenop disabled — removed tokenop hooks; other settings untouched.")
+    return 0
+
+
+def _detect_mode_from_settings(settings):
+    """Return ('every-prompt'|'session'|'disabled', has_legacy_dino)."""
+    has_open = has_close = has_legacy = False
+    hooks = settings.get("hooks", {}) if isinstance(settings, dict) else {}
+    if isinstance(hooks, dict):
+        for event, groups in hooks.items():
+            if not isinstance(groups, list):
+                continue
+            for group in groups:
+                if not isinstance(group, dict):
+                    continue
+                for h in group.get("hooks", []) or []:
+                    if not isinstance(h, dict):
+                        continue
+                    cmd = h.get("command", "")
+                    if not isinstance(cmd, str):
+                        continue
+                    if "tokenop open" in cmd:
+                        has_open = True
+                    if "tokenop close" in cmd:
+                        has_close = True
+                    if "dino-claude-hook" in cmd:
+                        has_legacy = True
+    if has_open and has_close:
+        return "every-prompt", has_legacy
+    if has_open:
+        return "session", has_legacy
+    return "disabled", has_legacy
+
+
+# =========================================================================== #
+# Window lifecycle — tokenop open / tokenop close (internal hook targets)
+# =========================================================================== #
+def _hook_log(msg):
+    try:
+        line = f"{time.strftime('%H:%M:%S')} {msg}\n"
+        path = hook_log_path()
+        _ensure_dir(path.parent)
+        with open(path, "a") as f:
+            f.write(line)
+    except Exception:
+        pass
+
+
+def _run_osascript(applescript_text, *args, timeout=10):
+    """Run an AppleScript via osascript. Returns (rc, stdout, stderr).
+    Never raises."""
+    try:
+        proc = subprocess.run(
+            ["osascript", "-", *[str(a) for a in args]],
+            input=applescript_text,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def build_open_applescript(choice):
+    """Pure builder: (inner_cmd, applescript_text). No side effects.
+    `choice` is a game id, or MENU_CHOICE to launch the game selector."""
+    pidf = str(pid_path(choice))
+    if choice == MENU_CHOICE:
+        launch = "exec '%s'" % TOKENOP_BIN              # bare tokenop -> game selector
+    else:
+        launch = "exec '%s' play %s" % (TOKENOP_BIN, choice)
+    # NOTE: literal "echo $$" — $$ must expand in the SPAWNED Terminal shell to
+    # the new process's PID. Do NOT backslash-escape it (Python strings don't
+    # treat \$ specially, so "\\$\\$" would send literal "$$" to the shell and
+    # the pid file would contain the text "$$" instead of a number).
+    inner_cmd = "echo $$ > '%s'; %s" % (pidf, launch)
+    applescript_text = (
+        "on run argv\n"
+        "  set theCmd to item 1 of argv\n"
+        '  tell application "Terminal"\n'
+        "    do script theCmd\n"
+        "    set wid to id of front window\n"
+        "  end tell\n"
+        "  return wid\n"
+        "end run\n"
+    )
+    return inner_cmd, applescript_text
+
+
+def build_close_applescript():
+    """Pure builder: AppleScript text to close the window whose id matches."""
+    return (
+        "on run argv\n"
+        "  set wid to (item 1 of argv) as integer\n"
+        '  tell application "Terminal"\n'
+        "    repeat with w in windows\n"
+        "      try\n"
+        "        if id of w is wid then\n"
+        "          close w\n"
+        "          exit repeat\n"
+        "        end if\n"
+        "      end try\n"
+        "    end repeat\n"
+        "  end tell\n"
+        "end run\n"
+    )
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _read_pid(game):
+    try:
+        return int(Path(pid_path(game)).read_text().strip())
+    except Exception:
+        return None
+
+
+def _close_window_impl(game):
+    """Kill the game process first, then close its Terminal window. Fail-soft."""
+    # 1. Kill the configured game's process (and sweep any *.pid files).
+    pid_files = []
+    try:
+        pid_files = list(state_dir().glob("*.pid"))
+    except Exception:
+        pid_files = []
+    # Ensure the configured game's pid file is included.
+    pf = pid_path(game)
+    if pf not in pid_files and pf.exists():
+        pid_files.append(pf)
+
+    for pf in pid_files:
+        try:
+            pid = int(Path(pf).read_text().strip())
+        except Exception:
+            pid = None
+        if pid and _pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                pass
+            for _ in range(5):
+                if not _pid_alive(pid):
+                    break
+                time.sleep(0.1)
+            if _pid_alive(pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+        try:
+            os.unlink(pf)
+        except Exception:
+            pass
+
+    # 2. Close the window matching window.id.
+    widf = window_id_path()
+    if widf.exists():
+        try:
+            wid = widf.read_text().strip()
+        except Exception:
+            wid = ""
+        try:
+            os.unlink(widf)
+        except Exception:
+            pass
+        if wid:
+            time.sleep(0.2)
+            _run_osascript(build_close_applescript(), wid)
+            _hook_log(f"close: window {wid}")
+    return 0
+
+
+def cmd_open():
+    """Open the configured game in a new Terminal window. Never raises."""
+    try:
+        cfg = load_config()
+        game = cfg["game"]
+
+        # Idempotency: a live game already running?
+        pid = _read_pid(game)
+        if pid and _pid_alive(pid):
+            _hook_log(f"open: already running ({pid})")
+            return 0
+
+        # Clear any stale window/pid from a previous session.
+        _close_window_impl(game)
+
+        inner_cmd, applescript = build_open_applescript(game)
+        _ensure_dir(state_dir())
+        rc, out, err = _run_osascript(applescript, inner_cmd)
+        wid = out.strip()
+        if wid:
+            try:
+                _atomic_write_text(window_id_path(), wid + "\n")
+            except Exception:
+                pass
+            _hook_log(f"open: window {wid}")
+            return 0
+        else:
+            _hook_log("open: no window id (grant Automation permission: "
+                      "System Settings > Privacy & Security > Automation)")
+            return 1
+    except Exception as e:
+        _hook_log(f"open: error {e}")
+        return 1
+
+
+def cmd_close():
+    """Kill the game + close its window. Never raises."""
+    try:
+        cfg = load_config()
+        game = cfg["game"]
+        return _close_window_impl(game)
+    except Exception as e:
+        _hook_log(f"close: error {e}")
+        return 0
+
+
+# =========================================================================== #
+# Doctor
+# =========================================================================== #
+def cmd_doctor():
+    results = []  # (level, msg)
+
+    def add(level, msg):
+        results.append((level, msg))
+
+    # 1. Python version.
+    v = sys.version_info
+    if v >= (3, 8):
+        add("PASS", f"Python {v.major}.{v.minor}.{v.micro} (>= 3.8)")
+    else:
+        add("FAIL", f"Python {v.major}.{v.minor}.{v.micro} (< 3.8)")
+
+    # 2. curses.
+    try:
+        import curses  # noqa: F401
+        add("PASS", "curses importable")
+    except Exception as e:
+        add("FAIL", f"curses not importable: {e}")
+
+    # 3. TERM_PROGRAM.
+    tp = os.environ.get("TERM_PROGRAM", "")
+    if tp == "Apple_Terminal":
+        add("PASS", "TERM_PROGRAM=Apple_Terminal")
+    else:
+        add("WARN", f"TERM_PROGRAM={tp or '(unset)'} — window mechanism targets Apple Terminal")
+
+    # 4. PATH has ~/.local/bin.
+    local_bin = str(Path("~/.local/bin").expanduser())
+    path_entries = os.environ.get("PATH", "").split(os.pathsep)
+    if local_bin in path_entries:
+        add("PASS", f"{local_bin} is on PATH")
+    else:
+        add("WARN", f"{local_bin} not on PATH — add: "
+                    f'export PATH="$HOME/.local/bin:$PATH"')
+
+    # 5. tokenop on PATH.
+    which = shutil.which("tokenop")
+    if which and os.path.realpath(which) == os.path.realpath(TOKENOP_BIN):
+        add("PASS", f"tokenop resolves to {TOKENOP_BIN}")
+    elif which:
+        add("WARN", f"tokenop on PATH is {which}, expected {TOKENOP_BIN}")
+    else:
+        add("WARN", f"tokenop not found on PATH (expected {TOKENOP_BIN})")
+
+    # 6. osascript present.
+    osa = shutil.which("osascript")
+    if osa:
+        add("PASS", f"osascript present ({osa})")
+    else:
+        add("FAIL", "osascript not found — window mechanism unavailable")
+
+    # 7. Automation permission probe (harmless, short timeout).
+    if osa:
+        probe = ('tell application "Terminal" to return name of '
+                 'application "Terminal"')
+        rc, out, err = _run_osascript(probe, timeout=5)
+        if rc == 0 and out:
+            add("PASS", "Automation permission OK (Terminal reachable)")
+        else:
+            add("WARN", "Automation permission not confirmed — grant in "
+                        "System Settings > Privacy & Security > Automation")
+    else:
+        add("WARN", "skipping Automation probe (no osascript)")
+
+    # 8. State/config dirs writable.
+    dirs_ok = True
+    for d in (config_dir(), state_dir()):
+        try:
+            _ensure_dir(d)
+            testf = d / ".write-test"
+            testf.write_text("x")
+            testf.unlink()
+        except Exception:
+            dirs_ok = False
+    if dirs_ok:
+        add("PASS", "config/state dirs writable")
+    else:
+        add("FAIL", "config/state dirs not writable")
+
+    n_fail = sum(1 for lvl, _ in results if lvl == "FAIL")
+    n_warn = sum(1 for lvl, _ in results if lvl == "WARN")
+    for lvl, msg in results:
+        print(f"[{lvl}] {msg}")
+    print(f"\ndoctor: {len(results)} checks, {n_fail} FAIL, {n_warn} WARN")
+    return 0 if n_fail == 0 else 1
+
+
+# =========================================================================== #
+# Control / input-setup selftest (headless, with fakes)
+# =========================================================================== #
+def selftest_controls(check):
+    """Prove the shared input-setup helper configures curses for snappy input
+    — most importantly that ESCDELAY is set (so arrow keys don't lag)."""
+
+    class _FakeStdscr:
+        def __init__(self):
+            self.calls = []
+        def nodelay(self, v):
+            self.calls.append(("nodelay", v))
+        def keypad(self, v):
+            self.calls.append(("keypad", v))
+
+    class _FakeCurses:
+        error = Exception
+        def __init__(self):
+            self.calls = []
+        def set_escdelay(self, ms):
+            self.calls.append(("set_escdelay", ms))
+        def curs_set(self, v):
+            self.calls.append(("curs_set", v))
+
+    fs = _FakeStdscr()
+    fc = _FakeCurses()
+    setup_input(fs, fc, nodelay=True)
+    cc = dict(fc.calls)
+    check(("set_escdelay", 25) in fc.calls,
+          "controls: setup_input calls set_escdelay(25) — fixes arrow-key lag")
+    check(("curs_set", 0) in fc.calls,
+          "controls: setup_input hides the cursor (curs_set(0))")
+    check(("keypad", True) in fs.calls,
+          "controls: setup_input enables keypad(True) (decodes arrows)")
+    check(("nodelay", True) in fs.calls,
+          "controls: setup_input sets nodelay(True) for real-time games")
+
+    # The menu passes nodelay=False; the helper must honour it.
+    fs2 = _FakeStdscr()
+    fc2 = _FakeCurses()
+    setup_input(fs2, fc2, nodelay=False)
+    check(("nodelay", False) in fs2.calls,
+          "controls: setup_input honours nodelay=False (blocking menu input)")
+
+    # Graceful degradation: an old curses without set_escdelay must not crash.
+    class _OldStdscr(_FakeStdscr):
+        pass
+
+    class _OldCurses:
+        error = Exception
+        def curs_set(self, v):
+            pass
+        # no set_escdelay attribute on purpose
+    crashed = False
+    try:
+        setup_input(_OldStdscr(), _OldCurses(), nodelay=True)
+    except Exception:
+        crashed = True
+    check(not crashed,
+          "controls: setup_input degrades gracefully without set_escdelay")
+
+    # Belt-and-suspenders: the module sets a snappy ESCDELAY env default.
+    check(os.environ.get("ESCDELAY") == "25",
+          "controls: module sets ESCDELAY=25 env default before curses init")
+
+
+# =========================================================================== #
+# Solvability autopilots (the key proof the games are controllable)
+# =========================================================================== #
+def _dino_autopilot(seed, target=300, max_frames=60000):
+    """Deterministic dino player using ONLY request_jump/duck, driving the real
+    update() at the real frame cadence. Jumps when an obstacle's contact is
+    imminent; ducks under low birds. Returns (reached_target, score)."""
+    dt = 1.0 / DINO_FPS
+    g = DinoGame(120, 30, seed=seed)
+    g.state = "playing"
+    t = 0.0
+    DINO_W = 8
+    for _ in range(max_frames):
+        t += dt
+        ahead = [o for o in g.obstacles
+                 if (o["x"] + _sprite_w(o["sprite"])) >= DINO_X]
+        ahead.sort(key=lambda o: o["x"])
+        if ahead:
+            o = ahead[0]
+            frames_to_contact = (o["x"] - (DINO_X + DINO_W)) / max(1e-6, g.speed)
+            if o["kind"] == "bird" and o["top"] >= g.ground - 3:
+                g.duck(t)                       # low bird -> duck under it
+            elif o["kind"] == "cactus" and g.on_ground and 0.0 <= frames_to_contact <= 2.0:
+                g.request_jump(t)               # jump the cactus at the last safe moment
+        g.update(t)
+        if g.state == "gameover":
+            return False, g.score
+        if g.score >= target:
+            return True, g.score
+    return g.score >= target, g.score
+
+
+def _flappy_autopilot(seed, target=8, max_frames=20000):
+    """Deterministic flappy player using ONLY flap(), aiming for the centre of
+    the next gap with a small deadband so it doesn't over-flap. Returns
+    (reached_target, score)."""
+    g = FlappyGame(80, 24, seed=seed)
+    g.state = "playing"
+    for _ in range(max_frames):
+        ahead = [p for p in g.pipes
+                 if (p["x"] + FLAPPY_PIPE_W) >= BIRD_X - 1]
+        ahead.sort(key=lambda p: p["x"])
+        if ahead:
+            p = ahead[0]
+            aim_center = p["gap_top"] + p["gap_h"] * 0.5
+        else:
+            aim_center = g.h / 2.0
+        bird_center = g.y + (FLAPPY_BIRD_H - 1) / 2.0
+        # Deadband (0.8) avoids over-flapping oscillation; only flap when sinking
+        # below the gap centre and not already rising fast.
+        if bird_center > aim_center + 0.8 and g.vy >= -0.3:
+            g.flap()
+        g.update()
+        if g.state == "gameover":
+            return False, g.score
+        if g.score >= target:
+            return True, g.score
+    return g.score >= target, g.score
+
+
+def _snake_autopilot(seed, target=10, max_steps=20000):
+    """Deterministic snake player using ONLY set_dir(), greedily steering toward
+    food while rejecting any immediately-fatal move. Returns (reached, score)."""
+    g = SnakeGame(20, 16, seed=seed)
+    g.state = "playing"
+
+    def fatal(name):
+        dx, dy = DIRS[name]
+        cdx, cdy = g._last_intended_dir()
+        if (dx, dy) == (-cdx, -cdy):
+            return True  # reversal would be ignored anyway
+        hx, hy = g.snake[0]
+        nx, ny = hx + dx, hy + dy
+        if nx < 0 or nx >= g.gw or ny < 0 or ny >= g.gh:
+            return True
+        tail = g.snake[-1]
+        eating = (nx, ny) == g.food
+        if (nx, ny) in g.cells and not (not eating and (nx, ny) == tail):
+            return True
+        return False
+
+    for _ in range(max_steps):
+        hx, hy = g.snake[0]
+        fx, fy = g.food if g.food else (hx, hy)
+        prefs = []
+        if fx > hx:
+            prefs.append("right")
+        elif fx < hx:
+            prefs.append("left")
+        if fy > hy:
+            prefs.append("down")
+        elif fy < hy:
+            prefs.append("up")
+        for nm in ("right", "left", "up", "down"):
+            if nm not in prefs:
+                prefs.append(nm)
+        for nm in prefs:
+            if not fatal(nm):
+                g.set_dir(nm)
+                break
+        g.step()
+        if g.state == "gameover":
+            return False, g.score
+        if g.score >= target:
+            return True, g.score
+    return g.score >= target, g.score
+
+
+def _pong_autopilot(seed, target=10, max_frames=20000):
+    """Deterministic pong player using ONLY move_up/move_down, tracking the ball
+    with the paddle centre. Returns (reached_target, score=rally hits)."""
+    dt = 1.0 / PONG_FPS
+    g = PongGame(60, 24, seed=seed)
+    g.state = "playing"
+    t = 0.0
+    for _ in range(max_frames):
+        t += dt
+        center = g.py + (PONG_PADDLE_H - 1) / 2.0
+        if g.by < center - 0.5:
+            g.move_up(t)
+        elif g.by > center + 0.5:
+            g.move_down(t)
+        g.update(t)
+        if g.state == "gameover":
+            return False, g.score
+        if g.score >= target:
+            return True, g.score
+    return g.score >= target, g.score
+
+
+def selftest_autopilots(check):
+    """Solvability proof: a reasonable controller, using ONLY the public input
+    methods driving the REAL update()/step(), reliably clears obstacles and
+    reaches a score threshold across multiple seeds. This is the headless
+    stand-in for 'a human can actually play this' — the anti-jank guarantee."""
+    SEEDS = (1, 7, 42)
+
+    dino_ok = all(_dino_autopilot(s, target=300)[0] for s in SEEDS)
+    dino_scores = [_dino_autopilot(s, target=300)[1] for s in SEEDS]
+    check(dino_ok,
+          f"autopilot: dino survives to score >=300 on seeds {SEEDS} "
+          f"(scores {dino_scores})")
+
+    flap_ok = all(_flappy_autopilot(s, target=8)[0] for s in SEEDS)
+    flap_scores = [_flappy_autopilot(s, target=8)[1] for s in SEEDS]
+    check(flap_ok,
+          f"autopilot: flappy passes >=8 pipes on seeds {SEEDS} "
+          f"(scores {flap_scores})")
+
+    snake_ok = all(_snake_autopilot(s, target=10)[0] for s in SEEDS)
+    snake_scores = [_snake_autopilot(s, target=10)[1] for s in SEEDS]
+    check(snake_ok,
+          f"autopilot: snake eats >=10 on seeds {SEEDS} "
+          f"(scores {snake_scores})")
+
+    pong_ok = all(_pong_autopilot(s, target=10)[0] for s in SEEDS)
+    pong_scores = [_pong_autopilot(s, target=10)[1] for s in SEEDS]
+    check(pong_ok,
+          f"autopilot: pong rallies to >=10 hits on seeds {SEEDS} "
+          f"(scores {pong_scores})")
+
+
+# =========================================================================== #
+# Selftest
+# =========================================================================== #
+def cmd_selftest():
+    state = {"ok": True}
+
+    def check(cond, msg):
+        cond = bool(cond)
+        if not cond:
+            state["ok"] = False
+        print(f"[{'ok  ' if cond else 'FAIL'}] {msg}")
+
+    # Run everything inside isolated temp dirs so no real file is touched.
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        old_env = {}
+        for k, v in {
+            "TOKENOP_CONFIG_DIR": str(td / "config"),
+            "TOKENOP_STATE_DIR": str(td / "state"),
+            "TOKENOP_CLAUDE_SETTINGS": str(td / "claude" / "settings.json"),
+        }.items():
+            old_env[k] = os.environ.get(k)
+            os.environ[k] = v
+
+        try:
+            print("== game logic ==")
+            selftest_dino(check)
+            selftest_snake(check)
+            selftest_pong(check)
+            selftest_flappy(check)
+
+            print("\n== controls / input ==")
+            selftest_controls(check)
+
+            print("\n== solvability autopilots ==")
+            selftest_autopilots(check)
+
+            print("\n== config round-trip ==")
+            cfg = load_config()
+            check(cfg == {"game": DEFAULT_CHOICE, "mode": "every-prompt"},
+                  "config: default load returns defaults (game selector)")
+            save_config({"game": "snake", "mode": "session"})
+            cfg = load_config()
+            check(cfg == {"game": "snake", "mode": "session"},
+                  "config: saved values round-trip")
+            # Invalid values fall back to defaults.
+            _atomic_write_json(config_path(), {"game": "bogus", "mode": "weird"})
+            cfg = load_config()
+            check(cfg == {"game": DEFAULT_CHOICE, "mode": "every-prompt"},
+                  "config: invalid game/mode fall back to defaults")
+            # Valid JSON on disk.
+            check(isinstance(_read_json(config_path(), None), dict),
+                  "config: written file is valid JSON")
+            # Highscores. (Use a fresh state dir so per-game selftest writes
+            # earlier in this run don't pollute the defaults check.)
+            with tempfile.TemporaryDirectory() as hd:
+                prev_state = os.environ.get("TOKENOP_STATE_DIR")
+                os.environ["TOKENOP_STATE_DIR"] = hd
+                try:
+                    save_high("snake", 99)
+                    check(load_high("snake") == 99,
+                          "config: save_high/load_high round-trip")
+                    check(load_high("dino") == 0,
+                          "config: unknown highscore defaults to 0")
+                finally:
+                    if prev_state is None:
+                        os.environ.pop("TOKENOP_STATE_DIR", None)
+                    else:
+                        os.environ["TOKENOP_STATE_DIR"] = prev_state
+
+            print("\n== enable / disable round-trip ==")
+            settings_path = Path(os.environ["TOKENOP_CLAUDE_SETTINGS"])
+            seed = {
+                "model": "opus",
+                "enabledPlugins": {
+                    "frontend-design@claude-plugins-official": True,
+                    "github@claude-plugins-official": True,
+                },
+                "effortLevel": "xhigh",
+                "tui": "fullscreen",
+                "theme": "dark",
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {"hooks": [{"type": "command",
+                                    "command": "/Users/x/.local/bin/dino-claude-hook open",
+                                    "async": True}]}
+                    ],
+                    "Stop": [
+                        {"hooks": [{"type": "command",
+                                    "command": "/Users/x/.local/bin/dino-claude-hook close",
+                                    "async": True}]}
+                    ],
+                },
+            }
+            _atomic_write_json(settings_path, seed)
+
+            rc = cmd_enable("every-prompt")
+            check(rc == 0, "enable: returns 0 on success")
+            s = _read_json(settings_path, None)
+            check(isinstance(s, dict), "enable: settings remains valid JSON")
+            check(s.get("model") == "opus", "enable: model key survives")
+            check(s.get("enabledPlugins", {}).get("github@claude-plugins-official") is True,
+                  "enable: enabledPlugins survives")
+            check(s.get("effortLevel") == "xhigh", "enable: effortLevel survives")
+            check(s.get("tui") == "fullscreen", "enable: tui survives")
+            check(s.get("theme") == "dark", "enable: theme survives")
+
+            def all_cmds(st):
+                out = []
+                for ev, groups in st.get("hooks", {}).items():
+                    for grp in groups:
+                        for h in grp.get("hooks", []):
+                            out.append((ev, h.get("command", ""), h.get("async")))
+                return out
+
+            cmds = all_cmds(s)
+            check(not any("dino-claude-hook" in c for _, c, _ in cmds),
+                  "enable: legacy dino-claude-hook hooks are removed")
+            check(_command_is_managed("/x/.local/bin/arcade open")
+                  and _command_is_managed("/x/.local/bin/arcade close"),
+                  "enable: legacy 'arcade' hooks are recognized for cleanup (migration)")
+            check(not _command_is_managed("/x/bin/notify 'tokenop open sesame'"),
+                  "enable: an unrelated hook merely containing 'tokenop open' is preserved")
+            open_hooks = [(ev, c) for ev, c, _ in cmds if "tokenop open" in c]
+            close_hooks = [(ev, c) for ev, c, _ in cmds if "tokenop close" in c]
+            check(len(open_hooks) == 1 and open_hooks[0][0] == "UserPromptSubmit",
+                  "enable: one tokenop open hook under UserPromptSubmit")
+            check(len(close_hooks) == 1 and close_hooks[0][0] == "Stop",
+                  "enable: one tokenop close hook under Stop")
+            check(all(a is True for _, c, a in cmds
+                      if "tokenop open" in c or "tokenop close" in c),
+                  "enable: all tokenop hooks have async:true")
+            check(load_config()["mode"] == "every-prompt",
+                  "enable: mode persisted to config")
+
+            # Idempotent.
+            cmd_enable("every-prompt")
+            s = _read_json(settings_path, None)
+            cmds = all_cmds(s)
+            check(sum(1 for _, c, _ in cmds if "tokenop open" in c) == 1,
+                  "enable: idempotent — exactly one open hook")
+            check(sum(1 for _, c, _ in cmds if "tokenop close" in c) == 1,
+                  "enable: idempotent — exactly one close hook")
+
+            # Session mode.
+            cmd_enable("session")
+            s = _read_json(settings_path, None)
+            cmds = all_cmds(s)
+            check(sum(1 for _, c, _ in cmds if "tokenop open" in c) == 1,
+                  "enable session: open hook present")
+            check(sum(1 for _, c, _ in cmds if "tokenop close" in c) == 0,
+                  "enable session: no close hook")
+            check(load_config()["mode"] == "session",
+                  "enable session: mode persisted to config")
+
+            # Disable.
+            cmd_disable()
+            s = _read_json(settings_path, None)
+            cmds = all_cmds(s)
+            check(not any("tokenop open" in c or "tokenop close" in c
+                          for _, c, _ in cmds),
+                  "disable: no tokenop hooks remain")
+            check(not any("dino-claude-hook" in c for _, c, _ in cmds),
+                  "disable: no legacy dino hooks remain")
+            check(s.get("model") == "opus", "disable: other keys intact")
+            check(isinstance(s, dict), "disable: settings remains valid JSON")
+            # Disable twice = clean no-op.
+            rc = cmd_disable()
+            check(rc == 0, "disable: running twice is a clean no-op")
+
+            print("\n== AppleScript construction ==")
+            inner, script = build_open_applescript("snake")
+            check(str(pid_path("snake")) in inner, "open script: inner has pid path")
+            check("exec" in inner, "open script: inner has exec")
+            check("play snake" in inner, "open script: inner has 'play snake'")
+            # menu choice launches the bare selector (no 'play'), with its own pid file.
+            m_inner, _ = build_open_applescript(MENU_CHOICE)
+            check(" play " not in m_inner and ("exec '%s'" % TOKENOP_BIN) in m_inner,
+                  "open script: menu choice launches the selector (no 'play')")
+            check(str(pid_path(MENU_CHOICE)) in m_inner,
+                  "open script: menu choice records its own pid file")
+            check("echo $$ >" in inner,
+                  "open script: inner uses literal 'echo $$' (PID expands in spawned shell)")
+            check("\\" not in inner,
+                  "open script: inner does NOT backslash-escape $$")
+            # Prove a real shell turns 'echo $$' into a numeric PID (regression
+            # guard for the $$ over-escaping bug).
+            import tempfile as _tf, subprocess as _sp
+            with _tf.TemporaryDirectory() as _td:
+                _pf = os.path.join(_td, "p.pid")
+                _rc = _sp.run(["bash", "-c", "echo $$ > '%s'" % _pf]).returncode
+                _val = open(_pf).read().strip() if os.path.exists(_pf) else ""
+                check(_rc == 0 and _val.isdigit(),
+                      "open script: 'echo $$' writes a numeric PID in a real shell")
+            check("do script" in script, "open script: has 'do script'")
+            check("id of front window" in script, "open script: has 'id of front window'")
+            close_script = build_close_applescript()
+            check("id of w is wid" in close_script, "close script: has 'id of w is wid'")
+            check("close w" in close_script, "close script: has 'close w'")
+
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    print()
+    print("SELFTEST PASSED" if state["ok"] else "SELFTEST FAILED")
+    return 0 if state["ok"] else 1
+
+
+# =========================================================================== #
+# Status
+# =========================================================================== #
+def cmd_status():
+    cfg = load_config()
+    path = claude_settings_path()
+    settings = _read_json(path, {})
+    mode_detected, has_legacy = _detect_mode_from_settings(settings)
+
+    print("tokenop status")
+    print("  hooks:")
+    if mode_detected == "disabled":
+        print("    tokenop hooks: not installed (disabled)")
+    else:
+        print(f"    tokenop hooks: installed (mode: {mode_detected})")
+    if has_legacy:
+        print("    NOTE: legacy dino-claude-hook hooks present (run 'tokenop enable' to clean)")
+    print(f"    settings file: {path}{'' if path.exists() else ' (missing)'}")
+
+    game_label = ("game selector (menu)" if cfg["game"] == MENU_CHOICE
+                  else cfg["game"])
+    print(f"  configured pop-up: {game_label}")
+    print(f"  configured mode: {cfg['mode']}")
+
+    print("  high scores:")
+    hs = _read_json(highscores_path(), {})
+    for gid in GAME_ORDER:
+        v = 0
+        if isinstance(hs, dict):
+            try:
+                v = int(hs.get(gid, 0))
+            except Exception:
+                v = 0
+        print(f"    {gid:<7} {v}")
+
+    print("  window state:")
+    widf = window_id_path()
+    if widf.exists():
+        try:
+            wid = widf.read_text().strip()
+        except Exception:
+            wid = "?"
+        print(f"    window.id: {wid}")
+    else:
+        print("    window.id: (none)")
+    try:
+        pid_files = sorted(state_dir().glob("*.pid"))
+    except Exception:
+        pid_files = []
+    if pid_files:
+        for pf in pid_files:
+            try:
+                pid = int(pf.read_text().strip())
+            except Exception:
+                pid = None
+            alive = pid is not None and _pid_alive(pid)
+            print(f"    {pf.name}: pid={pid} alive={alive}")
+    else:
+        print("    pid files: (none)")
+
+    print("  env:")
+    print(f"    TOKENOP_CONFIG_DIR      {config_dir()}")
+    print(f"    TOKENOP_STATE_DIR       {state_dir()}")
+    print(f"    TOKENOP_CLAUDE_SETTINGS {claude_settings_path()}")
+    print(f"    TOKENOP_BIN             {TOKENOP_BIN}")
+    print(f"    TERM_PROGRAM           {os.environ.get('TERM_PROGRAM', '(unset)')}")
+    return 0
+
+
+# =========================================================================== #
+# Menu (interactive)
+# =========================================================================== #
+def run_menu(stdscr):
+    import curses
+
+    ui = CursesUI(stdscr)
+    setup_input(stdscr, curses, nodelay=False)
+
+    cfg = load_config()
+    sel = GAME_ORDER.index(cfg["game"]) if cfg["game"] in GAME_ORDER else 0
+    flash_msg = ""
+    flash_until = 0.0
+
+    MIN_W, MIN_H = 40, 12
+
+    def draw():
+        nonlocal flash_msg
+        stdscr.erase()
+        ui.resize()
+        if ui.too_small(MIN_W, MIN_H):
+            ui.draw_too_small(MIN_W, MIN_H)
+            stdscr.refresh()
+            return
+        H, W = ui.H, ui.W
+        title = "Welcome to the Token Op Arcade"
+        ui.center(max(1, H // 2 - len(GAME_ORDER) - 3), title,
+                  ui.color("cyan", curses.A_BOLD))
+        ui.center(max(2, H // 2 - len(GAME_ORDER) - 2),
+                  "your Claude Code spinner companion",
+                  ui.color("white", curses.A_DIM))
+
+        cfg_now = load_config()
+        top = H // 2 - len(GAME_ORDER) // 2
+        for i, gid in enumerate(GAME_ORDER):
+            row = top + i
+            title_s = GAMES[gid]["title"]
+            marker = "▶ " if i == sel else "  "
+            default_tag = "  (default)" if gid == cfg_now["game"] else ""
+            line = f"{marker}{i + 1}. {title_s}{default_tag}"
+            attr = ui.color("yellow", curses.A_BOLD) if i == sel else ui.color("white")
+            ui.center(row, line, attr)
+
+        amode, _ = _detect_mode_from_settings(_read_json(claude_settings_path(), {}))
+        on = amode != "disabled"
+        astat = (f"● auto-open: ON ({amode})" if on else "○ auto-open: OFF")
+        ui.center(H - 6, astat + "   ·   press d to turn " + ("off" if on else "on"),
+                  ui.color("green" if on else "yellow", curses.A_BOLD))
+        footer1 = "↑/↓ move   Enter/SPACE play   1-4 jump"
+        footer2 = "s set default   d auto-open   q quit"
+        ui.center(H - 3, footer1, ui.color("white", curses.A_DIM))
+        ui.center(H - 2, footer2, ui.color("white", curses.A_DIM))
+        if flash_msg and time.monotonic() < flash_until:
+            ui.center(H - 4, flash_msg, ui.color("green", curses.A_BOLD))
+        stdscr.refresh()
+
+    while True:
+        draw()
+        c = stdscr.getch()
+        if c in (ord("q"), ord("Q"), 27):  # 27 = Esc
+            return
+        elif c in (curses.KEY_UP, ord("k")):
+            sel = (sel - 1) % len(GAME_ORDER)
+        elif c in (curses.KEY_DOWN, ord("j")):
+            sel = (sel + 1) % len(GAME_ORDER)
+        elif ord("1") <= c <= ord(str(len(GAME_ORDER))):
+            sel = c - ord("1")
+        elif c in (ord("\n"), curses.KEY_ENTER, ord(" "), ord("\r")):
+            gid = GAME_ORDER[sel]
+            GAMES[gid]["run"](stdscr)
+            # The game runner reconfigured input (nodelay=True etc.); restore
+            # the menu's blocking input on return.
+            setup_input(stdscr, curses, nodelay=False)
+        elif c in (ord("s"), ord("S")):
+            gid = GAME_ORDER[sel]
+            cfg = load_config()
+            cfg["game"] = gid
+            save_config(cfg)
+            flash_msg = f"default set to {gid}"
+            flash_until = time.monotonic() + 1.5
+        elif c in (ord("d"), ord("D")):
+            # Toggle the auto-open hooks right from the window that popped up.
+            amode, _ = _detect_mode_from_settings(_read_json(claude_settings_path(), {}))
+            if amode != "disabled":
+                ok, msg = apply_disable()
+            else:
+                cfg = load_config()
+                ok, msg = apply_enable(cfg.get("mode") or "every-prompt")
+            flash_msg = msg if ok else ("error: " + msg)
+            flash_until = time.monotonic() + 2.2
+
+
+# =========================================================================== #
+# CLI dispatch
+# =========================================================================== #
+def cmd_play(game):
+    if not is_valid_game(game):
+        sys.stderr.write(
+            f"tokenop: unknown game '{game}'. Valid games: {_valid_ids_str()}\n"
+        )
+        return 2
+    if not sys.stdout.isatty():
+        sys.stderr.write(
+            "tokenop play needs an interactive terminal. Try 'tokenop selftest'.\n"
+        )
+        return 1
+    import curses
+    curses.wrapper(GAMES[game]["run"])
+    return 0
+
+
+def cmd_list():
+    cfg = load_config()
+    for gid in GAME_ORDER:
+        tag = "  (default pop-up)" if gid == cfg["game"] else ""
+        print(f"{gid:<7} —  {GAMES[gid]['title']}{tag}")
+    mtag = "  (default pop-up)" if cfg["game"] == MENU_CHOICE else ""
+    print(f"{'menu':<7} —  Game selector (pick each time){mtag}")
+    return 0
+
+
+def cmd_set(game):
+    if not is_valid_choice(game):
+        sys.stderr.write(
+            f"tokenop: unknown game '{game}'. Valid: {_valid_ids_str()}, or 'menu'\n"
+        )
+        return 2
+    cfg = load_config()
+    cfg["game"] = game
+    save_config(cfg)
+    if game == MENU_CHOICE:
+        print("auto-open set to the game selector (menu) — pick a game each time.")
+    else:
+        print(f"default pop-up game set to {game}.")
+    return 0
+
+
+def cmd_config(show=False):
+    cfg = load_config()
+    print(json.dumps(cfg, indent=2))
+    print(f"config path: {config_path()}")
+    return 0
+
+
+def cmd_menu():
+    if not sys.stdout.isatty():
+        print(HELP_OVERVIEW)
+        return 0
+    import curses
+    curses.wrapper(run_menu)
+    return 0
+
+
+def _build_parser():
+    import argparse
+
+    class TokenopParser(argparse.ArgumentParser):
+        def error(self, message):
+            self.print_usage(sys.stderr)
+            sys.stderr.write(f"{self.prog}: error: {message}\n")
+            sys.exit(2)
+
+    parser = TokenopParser(
+        prog="tokenop",
+        description="macOS terminal games + a Claude Code spinner companion.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            env overrides (so tests never touch real files):
+              TOKENOP_CONFIG_DIR       default ~/.config/tokenop
+              TOKENOP_STATE_DIR        default ~/.local/state/tokenop
+              TOKENOP_CLAUDE_SETTINGS  default ~/.claude/settings.json
+
+            install / uninstall:
+              ./install.sh            copy to ~/.local/bin, selftest, enable, status
+              ./install.sh --uninstall
+        """),
+    )
+    sub = parser.add_subparsers(dest="cmd", metavar="<command>")
+
+    p_play = sub.add_parser("play", help="play a game",
+                            description="Play a game in the terminal.")
+    p_play.add_argument("game", help=f"one of: {_valid_ids_str()}")
+
+    sub.add_parser("list", help="list games (marks the default)")
+
+    p_set = sub.add_parser("set", help="set the default pop-up (a game, or 'menu')")
+    p_set.add_argument("game", help=f"one of: {_valid_ids_str()}, or 'menu' (selector)")
+
+    p_config = sub.add_parser("config", help="show resolved config + path")
+    p_config.add_argument("--show", action="store_true",
+                          help="show the resolved config (default behavior)")
+
+    p_enable = sub.add_parser("enable", help="install Claude Code hooks (merge-safe)")
+    p_enable.add_argument("--mode", choices=list(VALID_MODES), default="every-prompt",
+                          help="every-prompt (open+close) or session (open only)")
+
+    sub.add_parser("disable", help="remove tokenop hooks (other settings untouched)")
+    sub.add_parser("status", help="hooks/mode, default game, high scores, window, env")
+    sub.add_parser("doctor", help="environment checks (PASS/WARN/FAIL)")
+    sub.add_parser("selftest", help="headless logic + config + hooks self-test")
+
+    # Internal hook targets (still discoverable).
+    sub.add_parser("open", help="[internal/hook] open the game in a new window")
+    sub.add_parser("close", help="[internal/hook] kill the game + close its window")
+
+    return parser
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # Manual --help so we print the rich HELP_OVERVIEW (not argparse's default).
+    if argv and argv[0] in ("-h", "--help"):
+        print(HELP_OVERVIEW)
+        return 0
+
+    # No args ⇒ menu (or help if piped).
+    if not argv:
+        return cmd_menu()
+
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    cmd = args.cmd
+    if cmd is None:
+        return cmd_menu()
+    if cmd == "play":
+        return cmd_play(args.game)
+    if cmd == "list":
+        return cmd_list()
+    if cmd == "set":
+        return cmd_set(args.game)
+    if cmd == "config":
+        return cmd_config(show=getattr(args, "show", False))
+    if cmd == "enable":
+        return cmd_enable(args.mode)
+    if cmd == "disable":
+        return cmd_disable()
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "doctor":
+        return cmd_doctor()
+    if cmd == "selftest":
+        return cmd_selftest()
+    if cmd == "open":
+        return cmd_open()
+    if cmd == "close":
+        return cmd_close()
+
+    parser.print_usage(sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
